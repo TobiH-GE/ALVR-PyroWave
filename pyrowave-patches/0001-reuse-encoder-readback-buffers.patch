@@ -1,0 +1,101 @@
+diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
+index 2c535ad..da15578 100644
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -879,6 +879,9 @@ struct pyrowave_encoder_opaque
+ 	Fence queued_fence;
+ 	BufferHandle queued_meta;
+ 	BufferHandle queued_bitstream;
++	// ALVR: kept between frames, see pyrowave_encoder_encode_gpu_synchronous_inner.
++	BufferHandle queued_meta_gpu;
++	BufferHandle queued_bitstream_gpu;
+ 	ChromaSubsampling chroma = {};
+ 	int width = 0;
+ 	int height = 0;
+@@ -1036,37 +1039,64 @@ pyrowave_encoder_encode_gpu_synchronous_inner(pyrowave_encoder encoder,
+ 	                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+ 	                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+ 
+-	bufinfo.size = encoder->encoder.get_meta_required_size();
+-	bufinfo.domain = BufferDomain::CachedHost;
+-	encoder->queued_meta = device->create_buffer(bufinfo);
+-
+-	if (!encoder->queued_meta)
+-		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+-
+-	bufinfo.domain = BufferDomain::Device;
+-	auto queued_meta_gpu = device->create_buffer(bufinfo);
+-
+-	if (!queued_meta_gpu)
+-		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
+-
+ 	auto target_bitstream_size = rate_control->maximum_bitstream_size & ~VkDeviceSize(3u);
+ 
+ 	// Check for bogus sizes.
+ 	if (target_bitstream_size > UINT32_MAX || target_bitstream_size == 0)
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 
+-	bufinfo.size = target_bitstream_size + encoder->encoder.get_meta_required_size();
+-	bufinfo.domain = BufferDomain::CachedHost;
+-	encoder->queued_bitstream = device->create_buffer(bufinfo);
++	// ALVR: the readback buffers are reused while their sizes stay the same, instead of four new
++	// buffers per frame. Allocating (and later freeing) two host buffers of the frame size every
++	// frame cost ~1.8 ms of CPU in this call on Windows/NVIDIA, and reading freshly mapped memory
++	// every frame made the caller's pass over the bitstream ~5x slower.
++	// The previous frame must be done with them first. In the synchronous use this API is made for,
++	// the caller already waited in get_mapped_raw_bitstream or packetize, so this returns at once.
++	if (encoder->queued_fence)
++		encoder->queued_fence->wait();
+ 
+-	if (!encoder->queued_bitstream)
+-		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++	const VkDeviceSize meta_size = encoder->encoder.get_meta_required_size();
++	if (!encoder->queued_meta || !encoder->queued_meta_gpu ||
++	    encoder->queued_meta->get_create_info().size != meta_size)
++	{
++		encoder->queued_meta.reset();
++		encoder->queued_meta_gpu.reset();
++
++		bufinfo.size = meta_size;
++		bufinfo.domain = BufferDomain::CachedHost;
++		encoder->queued_meta = device->create_buffer(bufinfo);
++
++		if (!encoder->queued_meta)
++			return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++
++		bufinfo.domain = BufferDomain::Device;
++		encoder->queued_meta_gpu = device->create_buffer(bufinfo);
+ 
+-	bufinfo.domain = BufferDomain::Device;
+-	auto queued_bitstream_gpu = device->create_buffer(bufinfo);
++		if (!encoder->queued_meta_gpu)
++			return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
++	}
++	auto &queued_meta_gpu = encoder->queued_meta_gpu;
+ 
+-	if (!queued_bitstream_gpu)
+-		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
++	const VkDeviceSize bitstream_size = target_bitstream_size + meta_size;
++	if (!encoder->queued_bitstream || !encoder->queued_bitstream_gpu ||
++	    encoder->queued_bitstream->get_create_info().size != bitstream_size)
++	{
++		encoder->queued_bitstream.reset();
++		encoder->queued_bitstream_gpu.reset();
++
++		bufinfo.size = bitstream_size;
++		bufinfo.domain = BufferDomain::CachedHost;
++		encoder->queued_bitstream = device->create_buffer(bufinfo);
++
++		if (!encoder->queued_bitstream)
++			return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
++
++		bufinfo.domain = BufferDomain::Device;
++		encoder->queued_bitstream_gpu = device->create_buffer(bufinfo);
++
++		if (!encoder->queued_bitstream_gpu)
++			return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
++	}
++	auto &queued_bitstream_gpu = encoder->queued_bitstream_gpu;
+ 
+ 	Encoder::BitstreamBuffers bitstream_buffers = {};
+ 
