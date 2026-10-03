@@ -57,7 +57,9 @@ Run git @("-C", $PyroWave, "fetch", "origin")
 Run git @("-C", $PyroWave, "checkout", "-f", $PyroWaveCommit)
 # The streamer's own changes to PyroWave (encoder side only; the bitstream is unchanged, so the
 # client's Metal decoder is not affected). See pyrowave-patches\README.md.
-foreach ($patch in Get-ChildItem (Join-Path $Repo "pyrowave-patches") -Filter "*.patch" | Sort-Object Name) {
+# *.granite.patch go to PyroWave's Granite checkout (checkout_granite.sh, not a submodule) below.
+$Patches = Get-ChildItem (Join-Path $Repo "pyrowave-patches") -Filter "*.patch" | Sort-Object Name
+foreach ($patch in $Patches | Where-Object { $_.Name -notlike "*.granite.patch" }) {
     Run git @("-C", $PyroWave, "apply", "--ignore-whitespace", "--whitespace=nowarn", $patch.FullName)
     Write-Host "applied $($patch.Name)"
 }
@@ -65,6 +67,13 @@ $GitBash = Join-Path (Split-Path (Split-Path (Get-Command git).Source)) "bin\bas
 if (-not (Test-Path $GitBash)) { $GitBash = "bash" }
 Push-Location $PyroWave
 try { Run $GitBash @("checkout_granite.sh") } finally { Pop-Location }
+$Granite = Join-Path $PyroWave "Granite"
+# checkout_granite.sh keeps local changes, so drop an earlier run's patches first.
+Run git @("-C", $Granite, "checkout", "--", ".")
+foreach ($patch in $Patches | Where-Object { $_.Name -like "*.granite.patch" }) {
+    Run git @("-C", $Granite, "apply", "--ignore-whitespace", "--whitespace=nowarn", $patch.FullName)
+    Write-Host "applied $($patch.Name) to Granite"
+}
 
 Step "[3/5] Building PyroWave (Release)"
 $PyroBuild = Join-Path $PyroWave "build"

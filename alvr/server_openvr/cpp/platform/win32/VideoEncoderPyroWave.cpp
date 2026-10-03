@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <type_traits>
@@ -82,15 +83,16 @@ double MsBetween(std::chrono::steady_clock::time_point from, std::chrono::steady
 
 // The phases of one frame, from SteamVR's present to the packets queued for the network. They
 // add up to "total", which is what the dashboard shows as Encoding (frame composed -> frame
-// encoded, reported at the end of VideoSendPackets).
-const char* const kPhaseNames[8] = {
+// encoded, reported when VideoSendPackets gets the frame's last piece).
+const char* const kPhaseNames[VideoEncoderPyroWave::kPhaseCount] = {
     "wake",          // present thread -> encoder thread
     "copy submit",   // CPU: CopyResource, fence signal, flush
     "encode submit", // CPU: record and submit the Vulkan encode
     "D3D11 GPU",     // until D3D11 finished the composition (FrameRender) and the copy
     "Vulkan GPU",    // then until PyroWave's encode finished on its compute queue
-    "packetize",     // CPU: build_packets
-    "send",          // CPU: VideoSendPackets (FFI copy, packet vectors, queue to the send thread)
+    "plan",          // CPU: plan_packets (which blocks go into which packet)
+    "first piece",   // CPU: write the first ~256 KB of packets and queue them to the send thread
+    "rest",          // CPU: the same for the rest of the frame, while the first is on the wire
     "total",
 };
 
@@ -314,7 +316,9 @@ void VideoEncoderPyroWave::Initialize() {
             m_packetBytes
         );
     }
-    m_sendBuffer.reserve(m_maxFrameBytes * 2 + 64 * 1024);
+    // A piece stops at the first packet that reaches kSendPieceBytes; one oversized block can
+    // still make it longer, and the buffer then grows.
+    m_sendBuffer.reserve(kSendPieceBytes + 2 * m_packetBytes);
 
     Info(
         "PyroWave: encoder ready, %dx%d %s, at most %zu bytes per frame (%.2f bpp), %d stripes of "
@@ -497,10 +501,10 @@ void VideoEncoderPyroWave::SendStreamConfig() {
     );
 }
 
-bool VideoEncoderPyroWave::BuildPackets(
+bool VideoEncoderPyroWave::PlanPackets(
     const void* mappedBitstream, size_t bitstreamBytes, const void* mappedMeta, size_t metaBytes
 ) {
-    const char* problem = PyroWaveStripes::build_packets(
+    const char* problem = PyroWaveStripes::plan_packets(
         m_geometry,
         m_stripeBlocks,
         static_cast<const uint32_t*>(mappedBitstream),
@@ -508,9 +512,7 @@ bool VideoEncoderPyroWave::BuildPackets(
         static_cast<const PyroWaveStripes::BlockMeta*>(mappedMeta),
         metaBytes / sizeof(PyroWaveStripes::BlockMeta),
         m_packetBytes,
-        Settings::Instance().m_pyroWavePadPackets,
-        m_sendBuffer,
-        m_packetSizes
+        m_packetPlan
     );
     if (problem) {
         Error("PyroWave: cannot packetize the frame: %s\n", problem);
@@ -547,6 +549,10 @@ void VideoEncoderPyroWave::Transmit(
             return;
         }
     }
+
+    // Results of earlier frames. The timers belong to the present thread again once the input
+    // is released below, so they are read here.
+    CollectGpuTimers();
 
     ID3D11DeviceContext* context = m_d3dRender->GetContext();
     if (gpuTimer >= 0) {
@@ -607,6 +613,11 @@ void VideoEncoderPyroWave::Transmit(
     // a GPU-side wait; the CPU does not block here.
     m_context4->Wait(m_fence.Get(), readValue);
     const Clock::time_point encodeSubmitted = Clock::now();
+    // From here on this thread uses neither the composed texture nor the D3D11 context: the copy
+    // is queued ahead of anything the present thread records next, and the Wait above keeps the
+    // next copy off the shared texture until Vulkan is done. So SteamVR's Present can compose
+    // the next frame now instead of waiting until this one is sent.
+    ReleaseInput();
 
     // Only for the log: wait for the D3D11 part first, so the GPU time of each API is known. The
     // Vulkan encode waits for the same fence value on the GPU anyway, so this costs nothing but
@@ -629,20 +640,18 @@ void VideoEncoderPyroWave::Transmit(
     }
     const Clock::time_point encodeDone = Clock::now();
 
-    if (!BuildPackets(mappedBitstream, bitstreamBytes, mappedMeta, metaBytes)) {
+    if (!PlanPackets(mappedBitstream, bitstreamBytes, mappedMeta, metaBytes)) {
         return;
     }
-    const size_t frameBytes = m_sendBuffer.size();
-    const size_t packetCount = m_packetSizes.size();
+    const size_t packetCount = m_packetPlan.packet_count();
     // Without the padding, for the log.
     size_t codedBytes = 0;
-    for (size_t i = 0, offset = 0; i < packetCount; offset += m_packetSizes[i], i++) {
-        PyroWaveStripes::PacketPrefix prefix;
-        memcpy(&prefix, &m_sendBuffer[offset], sizeof(prefix));
-        codedBytes += sizeof(prefix) + prefix.data_bytes;
+    for (size_t i = 0; i < packetCount; i++) {
+        codedBytes += PyroWaveStripes::PacketPlan::overhead()
+            + size_t(m_packetPlan.data_words[i]) * sizeof(uint32_t);
     }
     m_statCodedBytes += codedBytes;
-    const Clock::time_point packetized = Clock::now();
+    const Clock::time_point planned = Clock::now();
 
     // Like SPS/PPS for H.264, the config goes out ahead of each IDR the scheduler asks for.
     // Every PyroWave frame is intra coded, so each one is reported as an IDR.
@@ -651,38 +660,69 @@ void VideoEncoderPyroWave::Transmit(
         m_configSent = true;
     }
     // Each packet becomes its own video packet with the frame's timestamp, so the headset can
-    // start decoding a stripe as soon as its packets are in.
-    VideoSendPackets(
-        targetTimestampNs,
-        m_sendBuffer.data(),
-        m_packetSizes.data(),
-        (unsigned int)packetCount,
-        true
-    );
+    // start decoding a stripe as soon as its packets are in. The packets are written and queued
+    // in pieces, so the first stripes are on the wire while the rest is still being written;
+    // writing is several times faster than the link, so the link sets the pace.
+    const bool pad = Settings::Instance().m_pyroWavePadPackets;
+    size_t frameBytes = 0;
+    Clock::time_point firstQueued = planned;
+    for (size_t first = 0; first < packetCount;) {
+        size_t end = first;
+        size_t pieceBytes = 0;
+        while (end < packetCount && (end == first || pieceBytes < kSendPieceBytes)) {
+            pieceBytes += m_packetPlan.packet_size(end, m_packetBytes, pad);
+            end++;
+        }
+        PyroWaveStripes::write_packets(
+            m_packetPlan,
+            static_cast<const uint32_t*>(mappedBitstream),
+            static_cast<const PyroWaveStripes::BlockMeta*>(mappedMeta),
+            m_packetBytes,
+            pad,
+            first,
+            end,
+            m_sendBuffer,
+            m_packetSizes
+        );
+        VideoSendPackets(
+            targetTimestampNs,
+            m_sendBuffer.data(),
+            m_packetSizes.data(),
+            (unsigned int)m_packetSizes.size(),
+            true,
+            first == 0,
+            end == packetCount
+        );
+        frameBytes += m_sendBuffer.size();
+        if (first == 0) {
+            firstQueued = Clock::now();
+        }
+        first = end;
+    }
 
     const Clock::time_point sent = Clock::now();
-    CollectGpuTimers();
 
-    const double phaseMs[8] = {
+    const double phaseMs[kPhaseCount] = {
         MsBetween(ready, start),
         MsBetween(start, copySubmitted),
         MsBetween(copySubmitted, encodeSubmitted),
         MsBetween(encodeSubmitted, copyDone),
         MsBetween(copyDone, encodeDone),
-        MsBetween(encodeDone, packetized),
-        MsBetween(packetized, sent),
+        MsBetween(encodeDone, planned),
+        MsBetween(planned, firstQueued),
+        MsBetween(firstQueued, sent),
         MsBetween(ready, sent),
     };
     ReportTiming(phaseMs, frameBytes, packetCount);
 }
 
 void VideoEncoderPyroWave::ReportTiming(
-    const double (&phaseMs)[8], size_t frameBytes, size_t packetCount
+    const double (&phaseMs)[kPhaseCount], size_t frameBytes, size_t packetCount
 ) {
     m_statFrames++;
     m_statBytes += frameBytes;
     m_statPackets += packetCount;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < kPhaseCount; i++) {
         m_statPhaseSumMs[i] += phaseMs[i];
         m_statPhaseMaxMs[i] = std::max(m_statPhaseMaxMs[i], phaseMs[i]);
     }
@@ -702,7 +742,7 @@ void VideoEncoderPyroWave::ReportTiming(
         (double)m_statPackets / m_statFrames
     );
     std::string split = "PyroWave timing, ms avg/max:";
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < kPhaseCount; i++) {
         char part[64];
         snprintf(
             part,
@@ -711,7 +751,7 @@ void VideoEncoderPyroWave::ReportTiming(
             kPhaseNames[i],
             m_statPhaseSumMs[i] / m_statFrames,
             m_statPhaseMaxMs[i],
-            i < 7 ? " |" : ""
+            i < kPhaseCount - 1 ? " |" : ""
         );
         split += part;
     }
@@ -729,24 +769,72 @@ void VideoEncoderPyroWave::ReportTiming(
         );
     }
 
-    // GPU timestamps of PyroWave's own passes (the RGB -> YCbCr input stage is not among them).
-    std::string gpu;
+    // GPU timestamps of PyroWave's own passes, plus two intervals from pyrowave-patches/0002:
+    // "encode total" (first command to end of the readback copy: the GPU time the encode occupies,
+    // gaps between passes included) and "readback copy". With pyrowave-patches/0003 the copy runs
+    // on a transfer queue of its own when the GPU has one: it is then reported as "readback copy
+    // (transfer queue)", and "encode total" ends with the compute passes.
+    struct GpuStats {
+        std::string passes;
+        double encodeTotalMs = -1.0;
+        double transferReadbackMs = -1.0;
+    } gpu;
     m_api.device_report_performance_stats(
         m_device,
         [](void* userdata, const char* msg) {
-            std::string& out = *static_cast<std::string*>(userdata);
+            GpuStats& out = *static_cast<GpuStats*>(userdata);
             // Memory heap lines are not what this log is for.
             if (strncmp(msg, "Memory Heap", 11) == 0) {
                 return;
             }
-            out += out.empty() ? " " : " | ";
-            out += msg;
+            double ms = 0.0;
+            if (sscanf(msg, "encode total: %lf", &ms) == 1) {
+                out.encodeTotalMs = ms;
+            }
+            if (sscanf(msg, "readback copy (transfer queue): %lf", &ms) == 1) {
+                out.transferReadbackMs = ms;
+            }
+            out.passes += out.passes.empty() ? " " : " | ";
+            out.passes += msg;
         },
         &gpu,
         true
     );
-    if (!gpu.empty()) {
-        Info("PyroWave GPU passes:%s\n", gpu.c_str());
+    if (!gpu.passes.empty()) {
+        Info("PyroWave GPU passes:%s\n", gpu.passes.c_str());
+    }
+    // Our share of the GPU: the D3D11 composition and copy plus the Vulkan encode, per frame and as
+    // a share of wall time. The Vulkan phase's wall time minus its GPU time is the hand-over from
+    // D3D11 (the queue noticing the fence) and the wake-up of this thread. A readback copy on the
+    // transfer queue (the copy engine) is not part of the share: the queues the game uses are free
+    // meanwhile. It is still part of the Vulkan phase's wall time.
+    if (gpu.encodeTotalMs >= 0.0 && m_statGpuTimed > 0) {
+        const double d3d11Ms = (m_statComposeGpuMs + m_statCopyGpuMs) / m_statGpuTimed;
+        const double ourMs = d3d11Ms + gpu.encodeTotalMs;
+        const double vulkanWallMs = m_statPhaseSumMs[4] / m_statFrames;
+        const double transferMs = std::max(0.0, gpu.transferReadbackMs);
+        char transfer[96] = "";
+        if (gpu.transferReadbackMs >= 0.0) {
+            snprintf(
+                transfer,
+                sizeof(transfer),
+                " (readback copy %.2f ms on the transfer queue, not counted)",
+                gpu.transferReadbackMs
+            );
+        }
+        Info(
+            "PyroWave GPU share: D3D11 %.2f + Vulkan %.2f = %.2f ms per frame, %.1f%% of the GPU's "
+            "time at %.1f fps%s; Vulkan phase %.2f ms wall time, %.2f ms of it hand-over and "
+            "wake-up\n",
+            d3d11Ms,
+            gpu.encodeTotalMs,
+            ourMs,
+            ourMs * m_statFrames / sinceReportMs * 100.0,
+            m_statFrames * 1000.0 / sinceReportMs,
+            transfer,
+            vulkanWallMs,
+            std::max(0.0, vulkanWallMs - gpu.encodeTotalMs - transferMs)
+        );
     }
 
     m_statStart = std::chrono::steady_clock::now();
@@ -758,7 +846,7 @@ void VideoEncoderPyroWave::ReportTiming(
     m_statComposeGpuMs = 0.0;
     m_statComposeGpuMaxMs = 0.0;
     m_statCopyGpuMs = 0.0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < kPhaseCount; i++) {
         m_statPhaseSumMs[i] = 0.0;
         m_statPhaseMaxMs[i] = 0.0;
     }

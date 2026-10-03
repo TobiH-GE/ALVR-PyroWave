@@ -70,7 +70,13 @@ public:
     void CaptureFrame();
 
 private:
+    // Lets the present thread go on: the composed texture and the D3D11 context are free again.
+    // Encoder thread only.
+    void ReleaseInput();
+
     CThreadEvent m_newFrameReady, m_encodeFinished;
+    // Whether the frame in Transmit has released its input yet. Encoder thread only.
+    bool m_inputReleased = true;
     std::shared_ptr<VideoEncoder> m_videoEncoder;
     bool m_bExiting;
     uint64_t m_presentationTime;

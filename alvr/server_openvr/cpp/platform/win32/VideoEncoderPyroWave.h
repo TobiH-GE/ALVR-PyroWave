@@ -53,6 +53,9 @@ public:
 
     void BeforeFrameRender() override;
 
+    // Phases of Transmit, see kPhaseNames in the .cpp.
+    static constexpr int kPhaseCount = 9;
+
 private:
     // The entry points of the PyroWave DLL that this encoder uses.
     struct Api {
@@ -81,10 +84,10 @@ private:
     void LoadApi();
     void CreateSharedTexture(const D3D11_TEXTURE2D_DESC& inputDesc);
     void SendStreamConfig();
-    // Cuts the coded blocks of the frame just encoded (as mapped by
-    // get_mapped_raw_bitstream) into packets, stripe by stripe, into m_sendBuffer /
-    // m_packetSizes. Returns false if the bitstream does not look right.
-    bool BuildPackets(
+    // Plans how the coded blocks of the frame just encoded (as mapped by
+    // get_mapped_raw_bitstream) go into packets, stripe by stripe, into m_packetPlan. Returns
+    // false if the bitstream does not look right.
+    bool PlanPackets(
         const void* mappedBitstream, size_t bitstreamBytes, const void* mappedMeta, size_t metaBytes
     );
     void ReleaseResources();
@@ -92,7 +95,7 @@ private:
     void CreateGpuTimers();
     void CollectGpuTimers();
     // Adds one frame's split to the statistics and logs them every 5 s.
-    void ReportTiming(const double (&phaseMs)[8], size_t frameBytes, size_t packetCount);
+    void ReportTiming(const double (&phaseMs)[kPhaseCount], size_t frameBytes, size_t packetCount);
 
     std::shared_ptr<CD3DRender> m_d3dRender;
     Microsoft::WRL::ComPtr<ID3D11Device5> m_device5;
@@ -148,6 +151,11 @@ private:
     // Largest packet (prefix included) that fits one datagram; a single coded block larger
     // than this still goes out as one packet, which the socket then splits.
     size_t m_packetBytes = 0;
+    // Packets are written and handed to the network in pieces of about this size (a frame is
+    // several MB at 4 bpp); the send thread hands them to the socket in chunks of the same size.
+    static constexpr size_t kSendPieceBytes = 256 * 1024;
+    PyroWaveStripes::PacketPlan m_packetPlan;
+    // The piece being handed over.
     std::vector<uint8_t> m_sendBuffer;
     std::vector<uint32_t> m_packetSizes;
     bool m_configSent = false;
@@ -161,9 +169,8 @@ private:
     uint64_t m_statBytes = 0;
     uint64_t m_statCodedBytes = 0;
     uint64_t m_statPackets = 0;
-    // Per phase of Transmit, see kPhaseNames in the .cpp.
-    double m_statPhaseSumMs[8] = {};
-    double m_statPhaseMaxMs[8] = {};
+    double m_statPhaseSumMs[kPhaseCount] = {};
+    double m_statPhaseMaxMs[kPhaseCount] = {};
 };
 
 #endif

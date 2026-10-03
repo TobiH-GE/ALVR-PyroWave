@@ -215,7 +215,9 @@ void (*VideoSendPackets)(
     const unsigned char* buf,
     const unsigned int* sizes,
     unsigned int count,
-    bool isIdr
+    bool isIdr,
+    bool firstPiece,
+    bool lastPiece
 );
 void (*HapticsSend)(unsigned long long path, float duration_s, float frequency, float amplitude);
 void (*ShutdownRuntime)();

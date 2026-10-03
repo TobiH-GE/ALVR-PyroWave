@@ -1,5 +1,93 @@
 #include "CEncoder.h"
 
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace {
+
+// Keeps the encoder thread on the fastest cores and out of power throttling (EcoQoS), like the
+// video send thread (server_core machine.rs). On a hybrid CPU Windows moves threads between core
+// classes on its own; measured in the JPEG XS streamer, the same work took ~3x as long on an
+// efficiency core and ~7x on a throttled one. The functions are looked up at runtime, so older
+// Windows versions just skip it. Returns what was done, for the log.
+std::string KeepOnPerformanceCores() {
+    typedef BOOL(WINAPI * GetCpuSetsFn)(PVOID, ULONG, PULONG, HANDLE, ULONG);
+    typedef BOOL(WINAPI * SetThreadCpuSetsFn)(HANDLE, const ULONG*, ULONG);
+    typedef BOOL(WINAPI * SetThreadInformationFn)(HANDLE, int, LPVOID, DWORD);
+    struct PowerThrottlingState {
+        ULONG version;
+        ULONG controlMask;
+        ULONG stateMask;
+    };
+    const int kThreadPowerThrottling = 3;
+    const ULONG kExecutionSpeed = 1;
+
+    std::string notes;
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    auto setInfo = kernel32
+        ? reinterpret_cast<SetThreadInformationFn>(GetProcAddress(kernel32, "SetThreadInformation"))
+        : nullptr;
+    auto getSets = kernel32
+        ? reinterpret_cast<GetCpuSetsFn>(GetProcAddress(kernel32, "GetSystemCpuSetInformation"))
+        : nullptr;
+    auto setSets = kernel32
+        ? reinterpret_cast<SetThreadCpuSetsFn>(GetProcAddress(kernel32, "SetThreadSelectedCpuSets"))
+        : nullptr;
+
+    // Control bit set, state bit clear: this thread opts out of EcoQoS.
+    PowerThrottlingState state = { 1, kExecutionSpeed, 0 };
+    bool ok = setInfo && setInfo(GetCurrentThread(), kThreadPowerThrottling, &state, sizeof(state));
+    notes += ok ? "power throttling off ok" : "power throttling off FAILED";
+
+    if (!getSets || !setSets) {
+        return notes + ", cpu sets unavailable";
+    }
+    // SYSTEM_CPU_SET_INFORMATION entries: Size u32 @0, Type u32 @4, Id u32 @8,
+    // EfficiencyClass u8 @18. A higher class is a faster core.
+    ULONG length = 0;
+    getSets(nullptr, 0, &length, GetCurrentProcess(), 0);
+    std::vector<unsigned char> buffer(length);
+    if (length == 0 || !getSets(buffer.data(), length, &length, GetCurrentProcess(), 0)) {
+        return notes + ", cpu sets unavailable";
+    }
+    std::vector<std::pair<ULONG, unsigned char>> sets;
+    for (size_t offset = 0; offset + 20 <= length;) {
+        ULONG size, kind, id;
+        memcpy(&size, &buffer[offset], 4);
+        memcpy(&kind, &buffer[offset + 4], 4);
+        memcpy(&id, &buffer[offset + 8], 4);
+        if (size < 20) {
+            break;
+        }
+        if (kind == 0) {
+            sets.push_back({ id, buffer[offset + 18] });
+        }
+        offset += size;
+    }
+    unsigned char fastest = 0, slowest = 255;
+    for (auto& set : sets) {
+        fastest = set.second > fastest ? set.second : fastest;
+        slowest = set.second < slowest ? set.second : slowest;
+    }
+    if (sets.empty() || fastest == slowest) {
+        return notes + ", " + std::to_string(sets.size())
+            + " logical cpus, all one class: no pinning";
+    }
+    std::vector<ULONG> ids;
+    for (auto& set : sets) {
+        if (set.second == fastest) {
+            ids.push_back(set.first);
+        }
+    }
+    ok = setSets(GetCurrentThread(), ids.data(), (ULONG)ids.size());
+    return notes + ", pinned to " + std::to_string(ids.size()) + " of "
+        + std::to_string(sets.size()) + " logical cpus (efficiency class " + std::to_string(fastest)
+        + ") " + (ok ? "ok" : "FAILED");
+}
+
+} // namespace
+
 CEncoder::CEncoder()
     : m_bExiting(false)
     , m_targetTimestampNs(0) {
@@ -128,12 +216,17 @@ bool CEncoder::CopyToStaging(
 void CEncoder::Run() {
     Debug("CEncoder: Start thread. Id=%d\n", GetCurrentThreadId());
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_MOST_URGENT);
+    Info("CEncoder: encoder thread %s\n", KeepOnPerformanceCores().c_str());
+    if (m_videoEncoder) {
+        m_videoEncoder->SetInputReleasedCallback([this] { ReleaseInput(); });
+    }
 
     while (!m_bExiting) {
         m_newFrameReady.Wait();
         if (m_bExiting)
             break;
 
+        m_inputReleased = false;
         if (m_FrameRender->GetTexture()) {
             m_videoEncoder->SetFrameReadyTime(m_frameReadyTime);
             m_videoEncoder->Transmit(
@@ -144,6 +237,15 @@ void CEncoder::Run() {
             );
         }
 
+        ReleaseInput();
+    }
+}
+
+void CEncoder::ReleaseInput() {
+    // Once per frame: m_encodeFinished is an auto-reset event, so a second Set would let the
+    // present thread compose over a frame this thread has not copied yet.
+    if (!m_inputReleased) {
+        m_inputReleased = true;
         m_encodeFinished.Set();
     }
 }

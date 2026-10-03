@@ -54,10 +54,52 @@ Defaults that matter (all settings are in the dashboard or the app's Advanced Se
 - App: Single Frame Buffer, Late Frame Pickup and Tracking Send Phase on.
 
 Known limits:
-- visionOS sometimes runs the display at 100 Hz under the 90 fps stream (seen in the morning runs
-  of 2026-09-27, not in the last six runs). The app notices and logs it ("Display rate: ...") and
-  asks for 90 Hz again, which so far did not help; frames then drift through the display cycle and
-  ~10% of display frames show no new video frame. Workaround: stream at 100 fps.
+- visionOS runs the display at 100 Hz, whatever the app asks for, when the passthrough cameras
+  detect 50 Hz flicker from artificial light (mains-powered lamps in 50 Hz countries;
+  "Passthrough_50Hz_Flicker_Detected" in visionOS). Under a 90 fps stream frames then drift
+  through the display cycle and ~10% of display frames show no new video frame. The app logs it
+  ("Frame rate: ..."). Workarounds: stream at 100 fps (app: Stream refresh rate 100, streamer:
+  preferred fps 100), or light the room without 50 Hz flicker (daylight, flicker-free lamps).
+- visionOS can also hand the app only every second display frame (22.22 ms at 90 Hz, 20.00 ms at
+  100 Hz) and reproject in between. Run 32 (2026-09-30, first long run with the FSR video filter)
+  spent minutes at a time there while the app met its own deadlines (1-2 missed of 450). The
+  client's "frame timing" line shows it as deadline-optimal 22.22 or 20.00; "Frame rate: ..."
+  names it, with the thermal state and the video filter ("Thermal state: ..." on every change).
+  Cause open; the clean test is the same game with Video Filter Bilinear. Up to that run the rate
+  watch and Tracking Send Phase ignored frame intervals over 20 ms, so they missed it.
+- 45 fps on the streamer with the headset at 90 Hz is the game: "game+SteamVR after vsync" 12-17
+  ms misses the 11.1 ms period and the present interval locks to 22.2 ms, with encoder wait 0.
+  The GPU percentage hides it: run 33 (2026-10-01, Bilinear, no throttling by visionOS) read
+  ~84 % at 90 fps and ~44 % at 45 fps, both ~9.5 ms of GPU work per frame, so the game sits at
+  the 11.1 ms budget and drops to half rate whenever a scene gets a little heavier. "Machine
+  load" now prints that directly ("~X ms gpu per frame") and the busiest logical core, for a
+  game held back by one thread. Levers are on the game side: render resolution, game settings.
+  Runs 34/35 (2026-10-01) ruled out downclocking: P0 at 2700-2820 of 3090 MHz in every window.
+  At full clock the GPU was busy 11.7 ms per frame (run 34, 4320x3456 per eye) and 14.7 ms
+  (run 35, 5376x4288), both over the 11.1 ms budget; in run 35 our own D3D11 copy also waited
+  7.8 ms in the GPU queue behind the game. Utilization percentages and their correlations are
+  not evidence against a GPU limit at a halved frame rate; GPU ms per frame is. CPU side:
+  "Machine load" lists the four busiest logical processors with counts over 90 and 70 %, and
+  "Busiest threads: ..." (its own thread, every 5 s) the three busiest threads on the machine
+  with their process plus the foreground process's cores and busiest thread, so a single
+  saturated game thread shows as ~100 % whatever cores Windows spreads it over.
+  Run 36 (same resolution as run 35, heavier scene) settled it: the game's busiest thread at
+  36-77 % (median 64 %), no logical processor over 90 % in any window, and ~14.7 ms of GPU per
+  frame outside vrserver (17.2 ms in the windows under 50 fps). Subnautica at these settings is
+  GPU-bound; no CPU limit. "Machine load" now also gives the foreground process's own GPU share
+  ("foreground ~X ms (N %)") from NVML's per-process samples, which are often empty.
+- The stream has no rate control: PyroWave sends a constant bits per pixel, and at 2.0 bpp and
+  12480x4992 that is ~3.16 Gbps, at the ceiling of a USB 5GbE adapter (USB 3.2 Gen 1, roughly
+  3.2-3.5 Gbps in practice, and it moves between days). Runs 40a/40b (2026-10-02) sat just
+  above it: the latency report's "network" grew to over a second while nothing upstream
+  changed. "network" is not measured: it is the total minus every measured stage, so it holds
+  any queue nothing else counts. With the default "Maximum" streamer send buffer the socket can
+  take hundreds of MB, so such a queue sits in the kernel, the send thread never blocks and no
+  frame is refused; Ethernet flow control (pause frames from the receiving adapter) keeps it
+  lossless. "Video send: ..." (every 5 s) gives the rate handed to the socket, how long the
+  send calls block, the queue to the send thread and refused pieces. Workarounds: lower
+  bits per pixel (1.55 gives ~2.5 Gbps), and/or a bounded "Streamer send buffer size" (Custom,
+  e.g. 12000000 bytes, about three frames) so an overload drops frames instead of queueing.
 - Tracking Send Phase still retreats from its best point in calm phases (it counts frames landing
   within 0.25 ms of the pickup as misses), and a big step during a load change can make a few
   percent of frames miss the pickup for one window. Next change: a smaller margin.
@@ -80,8 +122,11 @@ SteamVR frame (D3D11, RGBA8)
      signal a shared D3D11 fence (odd values)
   -> PyroWave Vulkan: waits on the fence, RGB -> YCbCr BT.709 full range, DWT, rate control,
      packing; signals the fence (even values); D3D11 waits on it before the next copy
-  -> build_packets (PyroWaveStripes.h): the coded 32x32 blocks, re-ordered by stripe, cut into
-     packets of one UDP datagram each; every packet = prefix + frame header + whole blocks
+  -> plan_packets (PyroWaveStripes.h): the coded 32x32 blocks, re-ordered by stripe, planned
+     into packets of one UDP datagram each; every packet = prefix + frame header + whole blocks
+  -> write_packets, in pieces of ~256 KB: each piece is written and queued to the send thread
+     right away (VideoSendPackets, first/last piece flagged), so the first stripes are on the
+     wire while the rest of the frame is still being written
   -> one ALVR video packet per PyroWave packet, all with the frame's timestamp, is_idr = true
   -> stream socket (Windows): ~46 datagrams per send call via UDP segmentation offload; the
      packets are padded to full size so consecutive ones can share a call
@@ -200,9 +245,34 @@ real run:
 
 - the streamer log lines starting with `PyroWave:` (device, queue priority, stripes and packet
   size; per 5 s: fps, Mbps, frame size, encode time, packets per frame),
+- `Frame pacing` (per 5 s: present interval, game+SteamVR from our vsync to the next Present,
+  time inside Present and waiting for the encoder, vsync wait and step) and `Machine load` (per
+  5 s: CPU of the machine and of vrserver, GPU total and vrserver's share via NVML). With both,
+  a slow phase shows whether we hold SteamVR up, the GPU is full, or neither (then the game's
+  CPU side). At stream start, `Video send thread:` and `CEncoder: encoder thread` say whether
+  the two threads were pinned to the performance cores and taken out of power throttling (on a
+  hybrid CPU; ported from the JPEG XS streamer, where an efficiency core made each send ~3x and
+  a throttled one ~7x slower),
 - the app log lines starting with `PyroWave:` (per 5 s: frames shown, dropped, incomplete and
   packets lost, receive time and "last packet to decoded", the tail the stripe pipeline is
   meant to keep short),
+- `Drawable:`, `Drawable eye N:` and `Stream eye N:` at stream start: the rate map's sizes, the
+  real view FOV, the center pixels per degree of the drawable (what the headset can show) and of
+  the stream (its full-resolution FFE center), and stream/drawable (about 1 means matched; above
+  1 the app scales the stream down). "Max Render Quality" (app setting, off by default) renders
+  at render quality 1.0, 6262x5020 per eye instead of 4338x3478; the streamer's resolution then
+  has to go up to match (6240x4992). Every 10 s `Rate map:` says whether the rate map changed and
+  where its full-rate center was: a map that followed the gaze would be the data for gaze-driven
+  foveated encoding (believed static for CompositorServices apps; Apple's gaze-driven Foveated
+  Streaming framework decodes the stream itself via CloudXR),
+- "Video Filter" and "Sharpen" (app settings, Metal renderer, applied within a second while
+  streaming): the filter that resamples the video frame into the drawable is Bilinear (the
+  default), Bicubic (Catmull-Rom, nine bilinear reads) or FSR (AMD FSR 1 EASU on luma, 12 texel
+  reads, edge-directed so diagonals do not staircase; chroma bicubic; Apple's private RGB-sampled
+  formats fall back to bicubic). "Sharpen" adds contrast adaptive sharpening of the luma (after
+  AMD's CAS, strength 0-1) against the softening of low bits per pixel; with FSR that pairs
+  EASU with a sharpening pass as FSR 1 does (there RCAS, here CAS). All of it only changes how the decoded
+  frame is displayed; it adds no information,
 - colors, and seams between stripes: a seam would mean a decode step ran before its inputs
   were complete,
 - PyroWave frames go through the shader's BT.709 full range transform, not the private YCbCr
@@ -236,13 +306,17 @@ reported composed, and shares the GPU with the game's next frame. The streamer n
 5 s, where the time goes:
 
 ```
-PyroWave timing, ms avg/max: wake | copy submit | encode submit | D3D11 GPU | Vulkan GPU | packetize | send | total
+PyroWave timing, ms avg/max: wake | copy submit | encode submit | D3D11 GPU | Vulkan GPU | plan | first piece | rest | total
 PyroWave GPU passes: DWT | Quant | Analyze | Resolve | Packing (GPU timestamps, ms per frame)
 ```
 
 `D3D11 GPU` is the composition and the copy (the graphics queue, contended by the game);
-`Vulkan GPU` is PyroWave's encode on its compute queue; `send` is the hand-over to Rust and the
-send thread. If `D3D11 GPU` dominates, running SteamVR/the streamer as administrator lets ALVR
+`Vulkan GPU` is PyroWave's encode on its compute queue; `plan` decides which blocks go into which
+packet; `first piece` writes the first ~256 KB of packets and hands them to Rust and the send
+thread, which puts them on the wire; `rest` does the same for the rest of the frame while the first
+pieces are already out. (Up to streamer 4d735407 the whole frame was written first, `packetize`,
+and then handed over, `send`; nothing of the frame was on the wire during those ~2 ms. The
+dashboard's Encoding still ends with the last piece, so the gain shows in network and total.) If `D3D11 GPU` dominates, running SteamVR/the streamer as administrator lets ALVR
 raise the process's GPU scheduling priority to realtime (vrserver.txt says `[GPU PRIO FIX]` when
 it cannot). If `Vulkan GPU` dominates, check the `queue priority` line at stream start.
 
@@ -302,23 +376,25 @@ Third run (4fbdac34, first one with client latencies), p50 at 5 bpp, 32 KB packe
 
 ## Known limits and next steps
 
-- **Display at 100 Hz under a 90 fps stream (open).** In every run with a client log visionOS ran
-  the display at 100 Hz (deadline-optimal 10.00 ms), often only after a while; ~10% of display
-  frames then have no new video frame, and frames drift through the display cycle (the streamer's
-  pickup phase lock shows it as a lead that creeps up without end). While that lasts, frame
-  buffering is spread over a whole period whatever either phase control does, which also made the
-  4-bpp runs look like the pickup phase lock halved frame buffering. Suspected cause: the rate
-  preference (AVDisplayCriteria) is set on the Entry window's display manager, and with "Dismiss
-  Window on Enter" (default on) that window is gone before a video format exists, so the preference
-  is never applied at all. The app now logs where the preference went ("Display criteria ..."),
-  notices a mismatched display period ("Display rate: ...") and asks again every 10 s; Tracking Send
-  Phase holds while the rates differ. With "Dismiss Window on Enter" off the preference does reach
-  the window (matching enabled), and run 6 stayed at 90 Hz; but in run 7 visionOS switched to 100 Hz
-  anyway, ~30 s in, right after a window with missed render deadlines, and asking again did not
-  bring 90 Hz back. Runs 8-10 (window dismissed or not) stayed at 90 Hz and even with the window
-  dismissed the preference reached a key window, so the window is not the cause; the switch looks
-  sporadic. Workaround to try: stream at 100 fps (app: Stream refresh rate 100, streamer:
-  preferred fps 100), so the stream matches the display.
+- **Encoder GPU time (run 20, 4864x1728, 4 bpp).** "encode total" 1.00 ms per frame, of which the
+  readback copy of the bitstream to host memory is 0.65 ms and all compute passes together
+  ~0.33 ms; with the D3D11 composition that is 10-11% of the GPU's time at 90 fps. The copy moves
+  about 4.3 MB (always the whole buffer) at ~6.6 GB/s, slow for PCIe 4.0 x16: worth checking the
+  GPU's link (GPU-Z, Bus Interface). `pyrowave-patches/0003` moves the copy to a transfer queue of
+  its own (the DMA engine) when the GPU has one; the "PyroWave GPU share" line then reports it
+  separately ("readback copy ... on the transfer queue, not counted"). Measured (runs 23-25): the
+  copy takes 0.17-0.35 ms on the transfer queue, the compute passes ~0.34 ms, the Vulkan phase
+  0.71-0.77 ms instead of 1.22-1.31 ms, and the GPU share falls to 4.3-5.1%.
+- **Display at 100 Hz under a 90 fps stream (cause known).** visionOS switches the display to
+  100 Hz when the passthrough cameras detect 50 Hz flicker from artificial light, to compensate for
+  it (reported from visionOS code, "Passthrough_50Hz_Flicker_Detected"); the app cannot ask it
+  away. That fits every run: the switch came 1-45 s after the stream started, not tied to the
+  window, renderer stalls (a forced 60 ms stall kept 90 Hz, run 22 switched without one), thermal
+  state or anything the app requested, and asking for 90 Hz again never brought it back. While it
+  lasts ~10% of display frames have no new video frame and frames drift through the display cycle
+  (the streamer's pickup phase lock shows a lead that creeps up without end); Tracking Send Phase
+  holds. The app logs the switch ("Frame rate: ..."). Workarounds: stream at 100 fps (app:
+  Stream refresh rate 100, streamer: preferred fps 100), or light the room without 50 Hz flicker.
 - **Tracking Send Phase (app setting, off by default, Metal renderer).** The headset sends one
   pose per display cycle, and the total latency counts from that sample. Frame buffering (a
   decoded frame waiting for the pickup, 4-8 ms p50 in the third run) means the chain finished that

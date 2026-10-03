@@ -6,6 +6,7 @@
 
 #include "alvr_server/Settings.h"
 
+#include <chrono>
 #include <mutex>
 
 class OvrDirectModeComponent : public vr::IVRDriverDirectModeComponent {
@@ -72,4 +73,40 @@ private:
     uint64_t m_prevTargetTimestampNs;
 
     std::mutex m_presentMutex;
+
+    // Frame pacing as SteamVR sees it, logged every 5 s ("Frame pacing, ms avg/max: ..."): how
+    // long SteamVR waits for us in Present (the encoder handing back the composed texture, and the
+    // composition) and in PostPresent (the virtual vsync), and how long SteamVR and the game take
+    // from that vsync to the next Present. The last is the game's own frame time: if it stays
+    // below one frame period while the frame rate halves, the pacing is at fault, not the game.
+    // The vsync step is the time between two vsyncs divided by the whole periods in between, so
+    // its min/max show how far the phase lock moves the virtual vsync.
+    using Clock = std::chrono::steady_clock;
+    struct PacingStat {
+        double sum = 0.0;
+        double max = 0.0;
+        double min = 1e9;
+        void add(double ms) {
+            sum += ms;
+            max = ms > max ? ms : max;
+            min = ms < min ? ms : min;
+        }
+    };
+    enum PacingPhase {
+        kPacingInterval, // Present to Present
+        kPacingGame, // vsync (PostPresent returned) to the next Present
+        kPacingPresent, // inside Present
+        kPacingEncoderWait, // of that: waiting for the encoder to release the composed texture
+        kPacingVsyncWait, // inside PostPresent: the virtual vsync
+        kPacingVsyncStep, // vsync to vsync, per frame period (phase-lock corrections show here)
+        kPacingPhaseCount
+    };
+    PacingStat m_pacing[kPacingPhaseCount];
+    int m_pacingFrames = 0;
+    int m_pacingLate = 0; // Present to Present longer than 1.5 frame periods
+    Clock::time_point m_pacingLogTime = Clock::now();
+    Clock::time_point m_lastPresentStart {};
+    Clock::time_point m_lastVsyncRelease {};
+    double m_encoderWaitMs = 0.0;
+    void LogPacingIfDue();
 };

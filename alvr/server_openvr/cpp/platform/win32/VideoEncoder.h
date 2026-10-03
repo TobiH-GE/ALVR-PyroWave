@@ -25,4 +25,22 @@ public:
     // Called on the present thread right before FrameRender records the composition of the next
     // frame, for encoders that time it on the GPU.
     virtual void BeforeFrameRender() { }
+
+    // Set by CEncoder before the first Transmit.
+    void SetInputReleasedCallback(std::function<void()> callback) {
+        m_inputReleased = std::move(callback);
+    }
+
+protected:
+    // An encoder may call this from Transmit once it no longer uses the composed texture or the
+    // D3D11 context, so the present thread can compose the next frame while this one is still
+    // encoded and sent. CEncoder releases the input after Transmit otherwise.
+    void ReleaseInput() {
+        if (m_inputReleased) {
+            m_inputReleased();
+        }
+    }
+
+private:
+    std::function<void()> m_inputReleased;
 };

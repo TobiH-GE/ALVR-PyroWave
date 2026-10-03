@@ -54,6 +54,63 @@ pub struct VideoPacket {
 
 // See the video send thread.
 const VIDEO_SEND_CHUNK_BYTES: usize = 256 * 1024;
+const MACHINE_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+// Send path counters for the "Video send" line (machine load thread, every 5 s). With the default
+// "Maximum" streamer send buffer the socket accepts far more than the link carries, and a backlog
+// then sits in the kernel where nothing of ours sees it: the send calls stay short, the queue to
+// the send thread stays empty and nothing is refused, while "network" (the latency left after
+// every measured stage) grows. With a bounded buffer the send calls block instead, the queue
+// fills, and send_video_frame_piece refuses pieces and asks for an IDR.
+pub mod video_send_stats {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static BUSY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LONGEST_NS: AtomicU64 = AtomicU64::new(0);
+    pub static QUEUED: AtomicUsize = AtomicUsize::new(0);
+    pub static QUEUE_PEAK: AtomicUsize = AtomicUsize::new(0);
+    pub static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn queued() {
+        let now = QUEUED.fetch_add(1, Ordering::Relaxed) + 1;
+        QUEUE_PEAK.fetch_max(now, Ordering::Relaxed);
+    }
+
+    pub fn dequeued() {
+        QUEUED
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    pub fn sent(bytes: usize, elapsed: std::time::Duration) {
+        let ns = elapsed.as_nanos() as u64;
+        BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        BUSY_NS.fetch_add(ns, Ordering::Relaxed);
+        LONGEST_NS.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    // "3.16 Gbps handed to the socket, send calls busy 9 % (longest 1.20 ms), queue to the send
+    // thread now 0, peak 17 pieces, 0 pieces refused". Resets the window.
+    pub fn line(seconds: f64) -> String {
+        let bytes = BYTES.swap(0, Ordering::Relaxed);
+        let busy = BUSY_NS.swap(0, Ordering::Relaxed);
+        let longest = LONGEST_NS.swap(0, Ordering::Relaxed);
+        let peak = QUEUE_PEAK.swap(QUEUED.load(Ordering::Relaxed), Ordering::Relaxed);
+        let refused = REFUSED.swap(0, Ordering::Relaxed);
+        let seconds = seconds.max(1e-3);
+        format!(
+            "{:.2} Gbps handed to the socket, send calls busy {:.0} % (longest {:.2} ms), queue to \
+             the send thread now {}, peak {peak} pieces, {refused} pieces refused",
+            bytes as f64 * 8.0 / seconds / 1e9,
+            busy as f64 / 1e9 / seconds * 100.0,
+            longest as f64 / 1e6,
+            QUEUED.load(Ordering::Relaxed),
+        )
+    }
+}
 
 // Payload buffers of video packets already copied to the socket, handed back by the send thread
 // so the next frame's packets are copied into memory that is already allocated and paged in.
@@ -952,17 +1009,65 @@ fn connection_pipeline(
     *ctx.video_channel_sender.lock() = Some(video_channel_sender);
     *ctx.haptics_sender.lock() = Some(haptics_sender);
 
+    // Video frames sent since the last machine load line, for its GPU time per frame.
+    let frames_sent = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    // Machine load lines, on their own thread: the per-thread CPU accounting walks every thread
+    // on the machine, which the send thread must not pay for.
+    thread::spawn({
+        let client_hostname = client_hostname.clone();
+        let frames_sent = Arc::clone(&frames_sent);
+        move || {
+            // The first sample only primes the counters (it would average since boot).
+            let mut machine_load = crate::machine::load::Load::new();
+            machine_load.line(0, 0.0);
+            machine_load.threads_line(0.0);
+            let mut logged = Instant::now();
+            while is_streaming(&client_hostname) {
+                thread::sleep(Duration::from_millis(250));
+                if logged.elapsed() < MACHINE_LOAD_LOG_INTERVAL {
+                    continue;
+                }
+                let seconds = logged.elapsed().as_secs_f64();
+                logged = Instant::now();
+                let frames = frames_sent.swap(0, std::sync::atomic::Ordering::Relaxed);
+                info!("Machine load: {}", machine_load.line(frames, seconds));
+                info!("Video send: {}", video_send_stats::line(seconds));
+                let threads = machine_load.threads_line(seconds);
+                if !threads.is_empty() {
+                    info!("Busiest threads: {threads}");
+                }
+            }
+        }
+    });
+
     let video_send_thread = thread::spawn({
         let client_hostname = client_hostname.clone();
+        let frames_sent = Arc::clone(&frames_sent);
         move || {
+            info!(
+                "Video send thread: {}",
+                crate::machine::keep_thread_on_performance_cores()
+            );
+            let mut last_frame_timestamp = None;
+
             let mut segmentation_reported = false;
             while is_streaming(&client_hostname) {
-                // One entry per frame: a single packet for H.264/HEVC/AV1, many for PyroWave.
+                // One entry per frame, a single packet for H.264/HEVC/AV1, or per piece of a frame,
+                // many packets for PyroWave (see send_video_frame_piece).
                 let packets = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
                     Ok(packets) => packets,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
+                video_send_stats::dequeued();
+                // A PyroWave frame arrives in several pieces with the same timestamp.
+                if let Some(first) = packets.first() {
+                    if last_frame_timestamp != Some(first.header.timestamp) {
+                        last_frame_timestamp = Some(first.header.timestamp);
+                        frames_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
 
                 // Handed to the socket in chunks while the rest is still being copied, so the
                 // first datagram of a multi-MB frame leaves after one chunk's copy rather than the
@@ -980,11 +1085,15 @@ fn connection_pipeline(
                     chunk_bytes += payload.len();
                     payloads.push(payload);
                     if chunk_bytes >= VIDEO_SEND_CHUNK_BYTES {
+                        let started = Instant::now();
                         video_sender.send_many(buffers.drain(..)).ok();
+                        video_send_stats::sent(chunk_bytes, started.elapsed());
                         chunk_bytes = 0;
                     }
                 }
+                let started = Instant::now();
                 video_sender.send_many(buffers).ok();
+                video_send_stats::sent(chunk_bytes, started.elapsed());
                 recycle_packet_buffers(payloads);
 
                 // Whether Windows took UDP segmentation offload is only known after a send.

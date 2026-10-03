@@ -1,0 +1,99 @@
+diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
+index 294477d..4bf0ba3 100644
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -884,6 +884,9 @@ struct pyrowave_encoder_opaque
+ 	BufferHandle queued_bitstream_gpu;
+ 	// ALVR: GPU timestamp at the start of the scaled encode, for the "encode total" interval.
+ 	QueryPoolHandle total_start;
++	// ALVR: whether the readback copy runs on a transfer queue of its own, see
++	// readback_on_transfer_queue.
++	bool readback_on_transfer = false;
+ 	ChromaSubsampling chroma = {};
+ 	int width = 0;
+ 	int height = 0;
+@@ -893,6 +896,37 @@ struct pyrowave_encoder_opaque
+ 	VideoScaler scaler;
+ };
+ 
++// ALVR: the readback copy of the bitstream (~4 MB at 4 bpp) took 0.6-0.7 ms of the encode's
++// ~1.0 ms on the compute queue, twice the time of all compute passes together. On a transfer
++// queue of its own (a DMA engine; pyrowave-patches/0003 also has Granite create one next to a
++// high priority compute queue) the compute queue is free once the passes are done, and the copy
++// engine does the copy. That needs a queue that really is separate, and timestamps on it: the
++// transfer queue family must have timestamp bits, and queries must be reset from the host
++// (vkCmdResetQueryPool is not available on transfer queues).
++static bool readback_on_transfer_queue(Device &device, CommandBuffer::Type compute_type)
++{
++#ifdef PYROWAVE_TEST_FORCE_TRANSFER_READBACK
++	// Only for testing this path on a device with a single queue (e.g. lavapipe): the transfer
++	// "queue" is then the compute queue, which the semaphore and the fence handle all the same.
++	(void)compute_type;
++	return device.get_device_features().vk12_features.hostQueryReset;
++#endif
++	const auto &info = device.get_queue_info();
++	const auto compute = device.get_physical_queue_type(compute_type);
++	if (info.queues[QUEUE_INDEX_TRANSFER] == VK_NULL_HANDLE ||
++	    info.queues[QUEUE_INDEX_TRANSFER] == info.queues[compute])
++		return false;
++	if (!device.get_device_features().vk12_features.hostQueryReset)
++		return false;
++
++	uint32_t count = 0;
++	vkGetPhysicalDeviceQueueFamilyProperties(device.get_physical_device(), &count, nullptr);
++	std::vector<VkQueueFamilyProperties> props(count);
++	vkGetPhysicalDeviceQueueFamilyProperties(device.get_physical_device(), &count, props.data());
++	const uint32_t family = info.family_indices[QUEUE_INDEX_TRANSFER];
++	return family < count && props[family].timestampValidBits != 0;
++}
++
+ pyrowave_result
+ pyrowave_encoder_create(const pyrowave_encoder_create_info *info, pyrowave_encoder *encoder)
+ {
+@@ -913,6 +947,9 @@ pyrowave_encoder_create(const pyrowave_encoder_create_info *info, pyrowave_encod
+ 	enc->chroma = ChromaSubsampling(info->chroma);
+ 	enc->width = info->width;
+ 	enc->height = info->height;
++	// A borrowed command buffer (the application's own) can only take the whole encode.
++	enc->readback_on_transfer =
++			!info->device->cmd && readback_on_transfer_queue(*enc->device, info->device->queue_type);
+ 
+ 	if (!enc->encoder.init(&info->device->device, info->width, info->height, enc->chroma))
+ 	{
+@@ -1148,6 +1185,36 @@ pyrowave_encoder_encode_gpu_synchronous_inner(pyrowave_encoder encoder,
+ 	// Performance issue since these memory types are mapped coherent on the GPU.
+ 	// A staging copy is just better. Could avoid it on iGPU, but iGPU isn't really supposed to be
+ 	// used as the encoder when streaming.
++	if (encoder->readback_on_transfer)
++	{
++		// ALVR: "encode total" is then the compute queue's part; the copy follows on the transfer
++		// queue, which waits for the compute submission with a semaphore. The buffers are shared
++		// between the queue families (concurrent sharing), so no ownership transfer is needed.
++		auto compute_end = cmd->write_timestamp(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
++		if (encoder->total_start)
++			device->register_time_interval("GPU", std::move(encoder->total_start), compute_end, "encode total");
++
++		Semaphore compute_done;
++		device->submit(cmd, nullptr, 1, &compute_done);
++		// The input image is only read by the compute submission, so it can go back now.
++		pyrowave_device_signal_semaphore(device, encoder->pyro_device->queue_type, release);
++
++		device->add_wait_semaphore(CommandBuffer::Type::AsyncTransfer, compute_done,
++		                           VK_PIPELINE_STAGE_2_COPY_BIT, true);
++		auto copy_cmd = device->request_command_buffer(CommandBuffer::Type::AsyncTransfer);
++		auto copy_start = copy_cmd->write_timestamp(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
++		copy_cmd->copy_buffer(*encoder->queued_meta, *queued_meta_gpu);
++		copy_cmd->copy_buffer(*encoder->queued_bitstream, *queued_bitstream_gpu);
++		auto copy_end = copy_cmd->write_timestamp(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
++		device->register_time_interval("GPU", copy_start, copy_end, "readback copy (transfer queue)");
++		copy_cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++		                  VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
++
++		encoder->queued_fence.reset();
++		device->submit(copy_cmd, &encoder->queued_fence);
++		return PYROWAVE_SUCCESS;
++	}
++
+ 	// ALVR: time the readback copy on its own, and close the "encode total" interval after it.
+ 	auto copy_start = cmd->write_timestamp(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+ 	cmd->copy_buffer(*encoder->queued_meta, *queued_meta_gpu);

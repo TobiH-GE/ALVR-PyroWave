@@ -1,5 +1,7 @@
 #include "OvrDirectModeComponent.h"
 
+#include <cmath>
+
 OvrDirectModeComponent::OvrDirectModeComponent(
     std::shared_ptr<CD3DRender> pD3DRender, std::shared_ptr<PoseHistory> poseHistory
 )
@@ -199,7 +201,11 @@ void OvrDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
     Debug("OvrDirectModeComponent::Present");
 
+    const Clock::time_point presentStart = Clock::now();
+    auto ms
+        = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
     m_presentMutex.lock();
+    m_encoderWaitMs = 0.0;
 
     ReportPresent(m_targetTimestampNs, 0);
 
@@ -256,13 +262,79 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
         m_pEncoder->NewFrameReady();
     }
 
+    const int refreshRate = Settings::Instance().m_refreshRate;
+    const double periodMs = 1000.0 / (refreshRate > 0 ? refreshRate : 90);
+    if (m_lastPresentStart != Clock::time_point {}) {
+        const double interval = ms(presentStart - m_lastPresentStart);
+        m_pacing[kPacingInterval].add(interval);
+        if (interval > 1.5 * periodMs) {
+            m_pacingLate++;
+        }
+    }
+    if (m_lastVsyncRelease != Clock::time_point {}) {
+        m_pacing[kPacingGame].add(ms(presentStart - m_lastVsyncRelease));
+    }
+    m_pacing[kPacingPresent].add(ms(Clock::now() - presentStart));
+    m_pacing[kPacingEncoderWait].add(m_encoderWaitMs);
+    m_pacingFrames++;
+    m_lastPresentStart = presentStart;
+
     m_presentMutex.unlock();
 }
 
 void OvrDirectModeComponent::PostPresent() {
     Debug("OvrDirectModeComponent::PostPresent");
 
+    auto ms
+        = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    const Clock::time_point start = Clock::now();
     WaitForVSync();
+    const Clock::time_point release = Clock::now();
+    m_pacing[kPacingVsyncWait].add(ms(release - start));
+    if (m_lastVsyncRelease != Clock::time_point {}) {
+        const int refreshRate = Settings::Instance().m_refreshRate;
+        const double periodMs = 1000.0 / (refreshRate > 0 ? refreshRate : 90);
+        const double sinceLast = ms(release - m_lastVsyncRelease);
+        const double periods = std::round(sinceLast / periodMs);
+        m_pacing[kPacingVsyncStep].add(sinceLast / (periods < 1.0 ? 1.0 : periods));
+    }
+    m_lastVsyncRelease = release;
+    LogPacingIfDue();
+}
+
+void OvrDirectModeComponent::LogPacingIfDue() {
+    const Clock::time_point now = Clock::now();
+    if (now - m_pacingLogTime < std::chrono::seconds(5) || m_pacingFrames == 0) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - m_pacingLogTime).count();
+    auto avg = [&](PacingPhase p) { return m_pacing[p].sum / m_pacingFrames; };
+    Info(
+        "Frame pacing, ms avg/max over %d presents (%.1f fps, %d later than 1.5 periods): "
+        "present interval %.2f/%.2f | game+SteamVR after vsync %.2f/%.2f | in Present %.2f/%.2f "
+        "(encoder wait %.2f/%.2f) | vsync wait %.2f/%.2f | vsync step min/max %.2f/%.2f\n",
+        m_pacingFrames,
+        m_pacingFrames / seconds,
+        m_pacingLate,
+        avg(kPacingInterval),
+        m_pacing[kPacingInterval].max,
+        avg(kPacingGame),
+        m_pacing[kPacingGame].max,
+        avg(kPacingPresent),
+        m_pacing[kPacingPresent].max,
+        avg(kPacingEncoderWait),
+        m_pacing[kPacingEncoderWait].max,
+        avg(kPacingVsyncWait),
+        m_pacing[kPacingVsyncWait].max,
+        m_pacing[kPacingVsyncStep].min,
+        m_pacing[kPacingVsyncStep].max
+    );
+    for (PacingStat& stat : m_pacing) {
+        stat = PacingStat {};
+    }
+    m_pacingFrames = 0;
+    m_pacingLate = 0;
+    m_pacingLogTime = now;
 }
 
 void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
@@ -321,9 +393,13 @@ void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
     m_pD3DRender->GetContext()->Flush();
 
     if (m_pEncoder) {
-        // Wait for the encoder to be ready.  This is important because the encoder thread
-        // blocks on transmit which uses our shared d3d context (which is not thread safe).
+        // Wait until the encoder has taken the last composed frame: the composition below
+        // overwrites it, and the encoder thread uses our shared d3d context. An encoder may
+        // release it before it is done with the frame (PyroWave: once the copy is queued).
+        const Clock::time_point waitStart = Clock::now();
         m_pEncoder->WaitForEncode();
+        m_encoderWaitMs
+            = std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count();
 
         std::string debugText;
 

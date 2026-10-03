@@ -340,14 +340,16 @@ extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_id
     }
 }
 
-// A frame as `count` packets laid out back to back in `buffer_ptr`, with their sizes in
-// `sizes_ptr` (PyroWave).
+// A piece of a frame as `count` packets laid out back to back in `buffer_ptr`, with their sizes
+// in `sizes_ptr` (PyroWave). See ServerCoreContext::send_video_frame_piece.
 extern "C" fn send_video_packets(
     timestamp_ns: u64,
     buffer_ptr: *const u8,
     sizes_ptr: *const u32,
     count: u32,
     is_idr: bool,
+    first_piece: bool,
+    last_piece: bool,
 ) {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         let sizes = unsafe { std::slice::from_raw_parts(sizes_ptr, count as usize) };
@@ -361,7 +363,13 @@ extern "C" fn send_video_packets(
             packet
         }));
 
-        context.send_video_packets(Duration::from_nanos(timestamp_ns), packets, is_idr);
+        context.send_video_frame_piece(
+            Duration::from_nanos(timestamp_ns),
+            packets,
+            is_idr,
+            first_piece,
+            last_piece,
+        );
     }
 }
 

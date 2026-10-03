@@ -2,6 +2,7 @@
 // streamer build_packets -> packets -> client parse_packet (and PyroWave's own parser),
 // plus the client's "stripes complete" bookkeeping under packet loss.
 #include "PyroWaveStripes.h"
+#include "build_packets_reference.h"
 #include "metal/pyrowave_bitstream.hpp"
 #include <cstdio>
 #include <random>
@@ -49,6 +50,34 @@ static void run(int width, int height, bool c444, int stripe_height, size_t pack
 	size_t total = 0;
 	for (uint32_t s : sizes) total += s;
 	EXPECT(total == out.size(), "sizes add up");
+
+	// Same bytes as the packer before the plan/write split ...
+	{
+		std::vector<uint8_t> ref_out;
+		std::vector<uint32_t> ref_sizes;
+		const char *ref_problem = build_packets_reference(g, stripe_blocks, words.data(), words.size(), meta.data(), meta.size(), packet_bytes, pad, ref_out, ref_sizes);
+		EXPECT(!ref_problem && ref_out == out && ref_sizes == sizes, "differs from the reference packer");
+	}
+	// ... and the same when written in pieces, as the streamer sends them.
+	{
+		PacketPlan plan;
+		EXPECT(!plan_packets(g, stripe_blocks, words.data(), words.size(), meta.data(), meta.size(), packet_bytes, plan), "plan");
+		EXPECT(plan.packet_count() == sizes.size(), "plan packet count");
+		std::vector<uint8_t> joined, piece;
+		std::vector<uint32_t> joined_sizes, piece_sizes;
+		for (size_t first = 0; first < plan.packet_count();)
+		{
+			const size_t end = std::min(plan.packet_count(), first + 1 + rng() % 9);
+			write_packets(plan, words.data(), meta.data(), packet_bytes, pad, first, end, piece, piece_sizes);
+			size_t piece_total = 0;
+			for (size_t p = first; p < end; p++) piece_total += plan.packet_size(p, packet_bytes, pad);
+			EXPECT(piece.size() == piece_total, "packet_size matches what is written");
+			joined.insert(joined.end(), piece.begin(), piece.end());
+			joined_sizes.insert(joined_sizes.end(), piece_sizes.begin(), piece_sizes.end());
+			first = end;
+		}
+		EXPECT(joined == out && joined_sizes == sizes, "pieces differ from the whole frame");
+	}
 
 	PyroWave::BlockLayout layout;
 	layout.init(width, height, c444 ? PyroWave::ChromaSubsampling::Chroma444 : PyroWave::ChromaSubsampling::Chroma420);
@@ -180,6 +209,8 @@ int main()
 				for (bool pad : { false, true })
 					run(s.first, s.second, c444, sh, 1400 - 18 - 13, pad, seed++);
 	run(4288, 1664, false, 64, 8000, true, seed++);
+	run(4864, 1728, false, 64, 32737, false, seed++);
+	run(4864, 1728, false, 64, 9216 - 18 - 13, true, seed++);
 	run(4288, 1664, false, 64, 300, true, seed++);
 
 	// An all-zero frame still yields one packet.
@@ -189,6 +220,9 @@ int main()
 		std::vector<uint8_t> out; std::vector<uint32_t> sizes;
 		const char *p = build_packets(g, g.stripe_blocks(), nullptr, 0, meta.data(), meta.size(), 1369, false, out, sizes);
 		EXPECT(!p && sizes.size() == 1 && sizes[0] == sizeof(PacketPrefix) + 8, "empty frame");
+		std::vector<uint8_t> ref_out; std::vector<uint32_t> ref_sizes;
+		build_packets_reference(g, g.stripe_blocks(), nullptr, 0, meta.data(), meta.size(), 1369, false, ref_out, ref_sizes);
+		EXPECT(ref_out == out && ref_sizes == sizes, "empty frame differs from the reference packer");
 	}
 
 	printf("%s (%d failures)\n", failures ? "FAILED" : "ALL OK", failures);

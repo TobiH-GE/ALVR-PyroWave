@@ -1,0 +1,23 @@
+diff --git a/vulkan/context.cpp b/vulkan/context.cpp
+index e76839bf..c70b8362 100644
+--- a/vulkan/context.cpp
++++ b/vulkan/context.cpp
+@@ -1209,8 +1209,16 @@ bool Context::create_device(VkPhysicalDevice gpu_, VkSurfaceKHR surface,
+ 	{
+ 		// If we're requesting high-prio compute queue, alias transfer on top of that.
+ 		// We don't want to risk failing realtime request due to requesting too many queues.
+-		queue_info.family_indices[QUEUE_INDEX_TRANSFER] = queue_info.family_indices[QUEUE_INDEX_COMPUTE];
+-		queue_indices[QUEUE_INDEX_TRANSFER] = queue_indices[QUEUE_INDEX_COMPUTE];
++		// ALVR: except for a transfer-only (DMA) queue. It belongs to a queue family of its own,
++		// which gets no priority request, so the compute family's request is not affected, and
++		// PyroWave's encoder can do its readback copy on the copy engine instead of the compute
++		// queue.
++		if (!find_vacant_queue(queue_info.family_indices[QUEUE_INDEX_TRANSFER], queue_indices[QUEUE_INDEX_TRANSFER],
++		                       VK_QUEUE_TRANSFER_BIT, VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT, 0.5f))
++		{
++			queue_info.family_indices[QUEUE_INDEX_TRANSFER] = queue_info.family_indices[QUEUE_INDEX_COMPUTE];
++			queue_indices[QUEUE_INDEX_TRANSFER] = queue_indices[QUEUE_INDEX_COMPUTE];
++		}
+ 	}
+ 	else
+ 	{

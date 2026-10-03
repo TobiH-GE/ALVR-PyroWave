@@ -5,6 +5,7 @@ mod hand_gestures;
 mod haptics;
 mod input_mapping;
 mod logging_backend;
+mod machine;
 mod sockets;
 mod statistics;
 mod tracking;
@@ -43,7 +44,7 @@ use std::{
     fs::File,
     io::Write,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, SyncSender, TrySendError},
         Arc, OnceLock,
     },
@@ -110,7 +111,7 @@ pub struct ConnectionContext {
     video_recording_file: Mutex<Option<File>>,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
-    // One entry per frame, see send_video_packets.
+    // One entry per frame, or per piece of one, see send_video_frame_piece.
     video_channel_sender: Mutex<Option<SyncSender<Vec<VideoPacket>>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
@@ -366,57 +367,73 @@ impl ServerCoreContext {
     pub fn send_video_nal(&self, target_timestamp: Duration, nal_buffer: Vec<u8>, is_idr: bool) {
         dbg_server_core!("send_video_nal");
 
-        self.send_video_packets(target_timestamp, vec![nal_buffer], is_idr);
+        self.send_video_frame_piece(target_timestamp, vec![nal_buffer], is_idr, true, true);
     }
 
-    // Sends one frame as several video packets that share its timestamp, each its own
-    // datagram-sized packet on the wire (PyroWave). The frame is queued, or dropped, as a whole,
-    // and reported to the statistics once.
-    pub fn send_video_packets(
+    // Sends a piece of one frame as video packets that share its timestamp, each its own
+    // datagram-sized packet on the wire (PyroWave). A frame can come in several pieces, so its
+    // first packets are on the wire while the encoder still writes the rest; the first and the last
+    // piece are flagged, a frame in one piece is both. Each piece is queued as it comes; once one
+    // is dropped the rest of that frame is too, and the frame is reported to the statistics once,
+    // with its last piece.
+    pub fn send_video_frame_piece(
         &self,
         target_timestamp: Duration,
         packets: Vec<Vec<u8>>,
         is_idr: bool,
+        first_piece: bool,
+        last_piece: bool,
     ) {
-        dbg_server_core!("send_video_packets");
+        dbg_server_core!("send_video_frame_piece");
 
         // start in the corrupts state, the client didn't receive the initial IDR yet.
         static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
         static LAST_IDR_INSTANT: Lazy<Mutex<Instant>> = Lazy::new(|| Mutex::new(Instant::now()));
+        // Of the frame being sent. Only the encoder thread sends video, one frame at a time.
+        static FRAME_BYTES: AtomicUsize = AtomicUsize::new(0);
+        static FRAME_DROPPED: AtomicBool = AtomicBool::new(false);
 
         if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
-            let buffer_size = packets.iter().map(|packet| packet.len()).sum();
+            let buffer_size = packets.iter().map(|packet| packet.len()).sum::<usize>();
 
-            if is_idr {
-                STREAM_CORRUPTED.store(false, Ordering::SeqCst);
-            }
+            if first_piece {
+                FRAME_BYTES.store(0, Ordering::Relaxed);
+                FRAME_DROPPED.store(false, Ordering::Relaxed);
 
-            if let Switch::Enabled(config) = &SESSION_MANAGER
-                .read()
-                .settings()
-                .extra
-                .capture
-                .rolling_video_files
-            {
-                if Instant::now()
-                    > *LAST_IDR_INSTANT.lock() + Duration::from_secs(config.duration_s)
+                if is_idr {
+                    STREAM_CORRUPTED.store(false, Ordering::SeqCst);
+                }
+
+                if let Switch::Enabled(config) = &SESSION_MANAGER
+                    .read()
+                    .settings()
+                    .extra
+                    .capture
+                    .rolling_video_files
                 {
-                    self.connection_context
-                        .events_sender
-                        .send(ServerCoreEvent::RequestIDR)
-                        .ok();
+                    if Instant::now()
+                        > *LAST_IDR_INSTANT.lock() + Duration::from_secs(config.duration_s)
+                    {
+                        self.connection_context
+                            .events_sender
+                            .send(ServerCoreEvent::RequestIDR)
+                            .ok();
 
-                    if is_idr {
-                        create_recording_file(
-                            &self.connection_context,
-                            SESSION_MANAGER.read().settings(),
-                        );
-                        *LAST_IDR_INSTANT.lock() = Instant::now();
+                        if is_idr {
+                            create_recording_file(
+                                &self.connection_context,
+                                SESSION_MANAGER.read().settings(),
+                            );
+                            *LAST_IDR_INSTANT.lock() = Instant::now();
+                        }
                     }
                 }
             }
+            FRAME_BYTES.fetch_add(buffer_size, Ordering::Relaxed);
 
-            if !STREAM_CORRUPTED.load(Ordering::SeqCst)
+            if FRAME_DROPPED.load(Ordering::Relaxed) {
+                // The rest of a frame that lost a piece: the client cannot finish it anyway.
+            } else if !STREAM_CORRUPTED.load(Ordering::SeqCst)
                 || !SESSION_MANAGER
                     .read()
                     .settings()
@@ -435,7 +452,7 @@ impl ServerCoreContext {
                     }
                 }
 
-                let frame = packets
+                let piece = packets
                     .into_iter()
                     .map(|payload| VideoPacket {
                         header: VideoPacketHeader {
@@ -446,25 +463,35 @@ impl ServerCoreContext {
                     })
                     .collect::<Vec<_>>();
 
-                if matches!(sender.try_send(frame), Err(TrySendError::Full(_))) {
+                let refused = matches!(sender.try_send(piece), Err(TrySendError::Full(_)));
+                if refused {
+                    connection::video_send_stats::REFUSED.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    connection::video_send_stats::queued();
+                }
+                if refused {
                     STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                    FRAME_DROPPED.store(true, Ordering::Relaxed);
                     self.connection_context
                         .events_sender
                         .send(ServerCoreEvent::RequestIDR)
                         .ok();
                     warn!("Dropping video packet. Reason: Can't push to network");
                 }
-            } else {
+            } else if first_piece {
                 warn!("Dropping video packet. Reason: Waiting for IDR frame");
             }
 
-            if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
-                let encoder_latency = stats.report_frame_encoded(target_timestamp, buffer_size);
+            if last_piece {
+                let frame_bytes = FRAME_BYTES.load(Ordering::Relaxed);
+                if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
+                    let encoder_latency = stats.report_frame_encoded(target_timestamp, frame_bytes);
 
-                self.connection_context
-                    .bitrate_manager
-                    .lock()
-                    .report_frame_encoded(target_timestamp, encoder_latency, buffer_size);
+                    self.connection_context
+                        .bitrate_manager
+                        .lock()
+                        .report_frame_encoded(target_timestamp, encoder_latency, frame_bytes);
+                }
             }
         }
     }

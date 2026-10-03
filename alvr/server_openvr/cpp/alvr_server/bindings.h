@@ -120,14 +120,17 @@ extern "C" void (*SetVideoConfigNals)(const unsigned char* configBuffer, int len
 extern "C" void (*VideoSend)(
     unsigned long long targetTimestampNs, unsigned char* buf, int len, bool isIdr
 );
-// One frame as `count` packets laid out back to back in `buf`, their sizes in `sizes`. Each
-// packet goes out as its own video packet with the frame's timestamp (PyroWave).
+// A piece of one frame: `count` packets laid out back to back in `buf`, their sizes in `sizes`.
+// Each packet goes out as its own video packet with the frame's timestamp (PyroWave). A frame
+// may come in several pieces, the first and last flagged; a whole frame is one piece that is both.
 extern "C" void (*VideoSendPackets)(
     unsigned long long targetTimestampNs,
     const unsigned char* buf,
     const unsigned int* sizes,
     unsigned int count,
-    bool isIdr
+    bool isIdr,
+    bool firstPiece,
+    bool lastPiece
 );
 extern "C" void (*HapticsSend)(
     unsigned long long path, float duration_s, float frequency, float amplitude
