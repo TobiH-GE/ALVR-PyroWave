@@ -91,6 +91,11 @@ void Settings::Load() {
         m_pyroWaveChroma444 = config.get("pyrowave_chroma_444").get<bool>();
         m_pyroWaveIntermediate16Bit = config.get("pyrowave_intermediate_16bit").get<bool>();
         m_pyroWaveHighPriorityQueue = config.get("pyrowave_high_priority_queue").get<bool>();
+        m_pyroWaveMotionVectors = config.get("pyrowave_motion_vectors").get<bool>();
+        m_pyroWaveMotionChoice = config.get("pyrowave_motion_choice").get<bool>();
+        m_pyroWaveMotionLevel = (uint32_t)config.get("pyrowave_motion_vectors_level").get<int64_t>();
+        m_pyroWaveMotionBothDirections = config.get("pyrowave_motion_vectors_both_directions").get<bool>();
+        m_pyroWaveMotionQuarterResolution = config.get("pyrowave_motion_vectors_quarter_resolution").get<bool>();
 
         m_nvencTuningPreset = (uint32_t)config.get("nvenc_tuning_preset").get<int64_t>();
         m_nvencMultiPass = (uint32_t)config.get("nvenc_multi_pass").get<int64_t>();

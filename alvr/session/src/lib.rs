@@ -113,6 +113,11 @@ pub struct OpenvrConfig {
     pub pyrowave_chroma_444: bool,
     pub pyrowave_intermediate_16bit: bool,
     pub pyrowave_high_priority_queue: bool,
+    pub pyrowave_motion_vectors: bool,
+    pub pyrowave_motion_choice: bool,
+    pub pyrowave_motion_vectors_level: u32,
+    pub pyrowave_motion_vectors_both_directions: bool,
+    pub pyrowave_motion_vectors_quarter_resolution: bool,
 
     // these settings are not used on the C++ side, but we need them to correctly trigger a SteamVR
     // restart

@@ -31,6 +31,9 @@
 // Stripe schedule and wire format shared with the client (PyroWaveStripes::StreamConfig is
 // the decoder config, PyroWaveStripes::PacketPrefix starts every packet).
 #include "PyroWaveStripes.h"
+#include "PyroWaveMotion.h"
+
+#include <memory>
 
 class VideoEncoderPyroWave : public VideoEncoder {
 public:
@@ -159,6 +162,15 @@ private:
     std::vector<uint8_t> m_sendBuffer;
     std::vector<uint32_t> m_packetSizes;
     bool m_configSent = false;
+    // Setting "Send motion vectors": NVIDIA Optical Flow against the previous frame, sent as extra
+    // packets of the frame. Null when off or not available.
+    std::unique_ptr<PyroWaveMotion> m_motion;
+    std::vector<uint8_t> m_motionBuffer;
+    std::vector<uint32_t> m_motionSizes;
+    // Sends the motion packets of the current frame if they are ready (or, with wait, once they
+    // are); returns true once they went out.
+    bool SendMotionPackets(uint64_t targetTimestampNs, bool wait, double waitMs = 4.0);
+    bool SendChoicePackets(uint64_t targetTimestampNs, bool wait, double waitMs = 4.0);
     // Set when a frame could not be encoded for good (e.g. an input format the encoder does
     // not take), so the log gets one error instead of one per frame.
     bool m_failed = false;

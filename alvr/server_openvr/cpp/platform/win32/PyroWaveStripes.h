@@ -76,6 +76,43 @@ struct PacketPrefix {
 };
 static_assert(sizeof(PacketPrefix) == 16, "PacketPrefix layout");
 
+// Motion vectors of a frame (streamer setting "Send motion vectors", for the headset's frame
+// interpolation). They go out as extra video packets with the frame's timestamp, between the
+// frame's own packets, as soon as the streamer has them. Each starts with a PacketPrefix whose
+// stripe is MotionStripe (stripe_count as in the frame; packet_index and packet_count count the
+// motion packets only; data_bytes the bytes after the prefix), then a MotionHeader, then the grid
+// rows [first_row, first_row + row_count): per cell int16 x, y in 1/32 picture pixels (NVIDIA
+// Optical Flow's S10.5), pointing from this frame to the reference frame, i.e. to where the cell's
+// content was in that frame; x = MotionUnreliable marks a cell without reliable motion (flat, no
+// texture to match), where the client should assume none beyond head rotation. A client that
+// does not know the packets drops them as malformed.
+static const uint16_t MotionStripe = 0xffff;
+static const int16_t MotionUnreliable = -32768;
+struct MotionHeader {
+    uint32_t magic; // MotionMagic
+    uint32_t version; // MotionVersion
+    uint64_t reference_timestamp_ns; // the earlier frame the vectors point into
+    uint16_t grid_width; // cells, both eyes side by side
+    uint16_t grid_height;
+    uint16_t cell_pixels; // picture pixels per cell, in both directions
+    uint16_t first_row;
+    uint16_t row_count;
+    uint16_t reserved[3];
+};
+static const uint32_t MotionMagic = 0x564d5750; // "PWMV"
+static const uint32_t MotionVersion = 1;
+
+// The streamer's motion choice of a frame (sent after its motion vectors, same PacketPrefix and
+// MotionHeader layout, magic MotionChoiceMagic): for every block of cell_pixels x cell_pixels
+// picture pixels which of three motions the in-between should follow there, chosen on the
+// original frames: 0 the motion field (the vectors above, as the headset prepares them), 1 head
+// rotation only (content fixed in the world), 2 none (content fixed to the view, like a HUD).
+// The grid rows carry 2 bits per block, four blocks per byte, the first block in the low bits.
+// The same choice the headset's "Choose Motion per Pixel" makes on its own GPU.
+static const uint32_t MotionChoiceMagic = 0x434d5750; // "PWMC"
+static const uint32_t MotionChoiceVersion = 1;
+static_assert(sizeof(MotionHeader) == 32, "MotionHeader layout");
+
 // PyroWave's BitstreamSequenceHeader (bitstream.md, "Start of frame header"), built with
 // explicit shifts so it does not depend on how a compiler lays out bitfields.
 inline void make_sequence_header(

@@ -43,6 +43,14 @@ pub enum FrameSize {
 
 #[repr(u32)]
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+pub enum OpticalFlowPerfLevel {
+    Slow = 5,
+    Medium = 10,
+    Fast = 20,
+}
+
+#[repr(u32)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
 pub enum EncoderQualityPreset {
     Quality = 0,
     Balanced = 1,
@@ -276,6 +284,41 @@ pub struct PyroWaveConfig {
     ))]
     #[schema(flag = "steamvr-restart")]
     pub high_priority_queue: bool,
+
+    #[schema(strings(
+        display_name = "Send motion vectors",
+        help = "Runs NVIDIA Optical Flow (the GPU's own optical flow unit, not the shader cores the game uses) on every frame against the previous one and sends the motion to the headset as a few extra packets per frame (about 130 KB at 4864x1728). The headset's Frame Interpolation (45 fps shown at 90 Hz) needs them. Needs an NVIDIA GPU; off leaves the stream exactly as before."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_vectors: bool,
+
+    #[schema(strings(
+        display_name = "Send motion choice",
+        help = "With Send motion vectors: also chooses, for every 8x8 pixels of each frame, which motion its in-between should follow (the motion vectors, head rotation only, or none for HUD elements fixed to the view), on the original frames, and sends the choice with the vectors (about 70 KB per frame). The headset's setting \"Interpolation: Motion Choice from Streamer\" uses it instead of choosing on its own GPU. Off: only the vectors go out, as before."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_choice: bool,
+
+    #[schema(strings(
+        display_name = "Motion vectors: optical flow level",
+        help = "NVIDIA Optical Flow's own speed/quality level. Slow: the most accurate vectors, about 8-10 ms per frame at 7040x2496. Medium and Fast take less time, so the vectors reach the headset earlier (it holds a frame back when they come after it), with less accurate vectors."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_vectors_level: OpticalFlowPerfLevel,
+
+    #[schema(strings(
+        display_name = "Motion vectors: check both directions",
+        help = "Computes the flow in both directions and sends a vector only where the flow back returns to its start (a line of text matches a few pixels off almost as well; those vectors fail the check and the headset fills them from their neighbours). Off: forward only, about half the optical flow time, unchecked vectors."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_vectors_both_directions: bool,
+
+    #[schema(strings(
+        display_name = "Motion vectors: quarter resolution",
+        help = "Runs the optical flow on the frame at a quarter of its resolution in each direction instead of half: about a quarter of the time, one vector per 16x16 pixel cell instead of averaging four."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_vectors_quarter_resolution: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
@@ -851,8 +894,11 @@ If you want to reduce the amount of pixelation on the edges, increase the center
     #[schema(flag = "steamvr-restart")]
     pub emulated_headset_view_resolution: FrameSize,
 
-    #[schema(strings(display_name = "Preferred FPS"))]
-    #[schema(gui(slider(min = 60.0, max = 120.0)), suffix = "Hz")]
+    #[schema(strings(
+        display_name = "Preferred FPS",
+        help = "45 Hz: SteamVR and the game render 45 frames per second; a headset that supports it shows them at 90 Hz and fills the frames in between (PyroWave client: Frame Interpolation)."
+    ))]
+    #[schema(gui(slider(min = 45.0, max = 120.0)), suffix = "Hz")]
     #[schema(flag = "steamvr-restart")]
     pub preferred_fps: f32,
 
@@ -1873,6 +1919,13 @@ pub fn session_settings_default() -> SettingsDefault {
                     chroma_444: false,
                     intermediate_16bit: true,
                     high_priority_queue: true,
+                    motion_vectors: false,
+                    motion_choice: true,
+                    motion_vectors_level: OpticalFlowPerfLevelDefault {
+                        variant: OpticalFlowPerfLevelDefaultVariant::Slow,
+                    },
+                    motion_vectors_both_directions: true,
+                    motion_vectors_quarter_resolution: false,
                 },
             },
             mediacodec_extra_options: {

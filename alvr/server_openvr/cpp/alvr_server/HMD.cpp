@@ -12,6 +12,9 @@
 
 #ifdef _WIN32
 #include "platform/win32/CEncoder.h"
+#ifdef ALVR_PYROWAVE
+#include "platform/win32/PyroWaveMotion.h"
+#endif
 #elif __APPLE__
 #include "platform/macos/CEncoder.h"
 #else
@@ -245,6 +248,10 @@ void Hmd::StartStreaming() {
     if (this->device_class == vr::TrackedDeviceClass_HMD) {
 #ifdef _WIN32
         m_encoder = std::make_shared<CEncoder>();
+#ifdef ALVR_PYROWAVE
+        // The motion choice takes the head rotation between two frames from these poses.
+        PyroWaveMotion::SetPoseHistory(m_poseHistory);
+#endif
         try {
             m_encoder->Initialize(m_D3DRender);
         } catch (Exception e) {
@@ -301,6 +308,12 @@ void Hmd::SetViewsConfig(FfiViewsConfig config) {
     if (m_encoder) {
         m_encoder->SetViewsConfig(left_proj, left_transform, right_proj, right_transform);
     }
+#ifdef ALVR_PYROWAVE
+    // The views' tangents as the headset uses them (left, right, up, down, all positive).
+    const float leftTangents[4] = { -tanf(config.fov[0].left), tanf(config.fov[0].right), tanf(config.fov[0].up), -tanf(config.fov[0].down) };
+    const float rightTangents[4] = { -tanf(config.fov[1].left), tanf(config.fov[1].right), tanf(config.fov[1].up), -tanf(config.fov[1].down) };
+    PyroWaveMotion::SetViewTangents(leftTangents, rightTangents);
+#endif
 #endif
 
     // todo: check if this is still needed

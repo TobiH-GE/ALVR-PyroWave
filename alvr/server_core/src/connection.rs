@@ -328,6 +328,19 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         pyrowave_chroma_444: settings.video.encoder_config.pyrowave.chroma_444,
         pyrowave_intermediate_16bit: settings.video.encoder_config.pyrowave.intermediate_16bit,
         pyrowave_high_priority_queue: settings.video.encoder_config.pyrowave.high_priority_queue,
+        pyrowave_motion_vectors: settings.video.encoder_config.pyrowave.motion_vectors,
+        pyrowave_motion_choice: settings.video.encoder_config.pyrowave.motion_choice,
+        pyrowave_motion_vectors_level: settings.video.encoder_config.pyrowave.motion_vectors_level.clone() as u32,
+        pyrowave_motion_vectors_both_directions: settings
+            .video
+            .encoder_config
+            .pyrowave
+            .motion_vectors_both_directions,
+        pyrowave_motion_vectors_quarter_resolution: settings
+            .video
+            .encoder_config
+            .pyrowave
+            .motion_vectors_quarter_resolution,
         controllers_enabled,
         controller_is_tracker,
         body_tracking_vive_enabled,

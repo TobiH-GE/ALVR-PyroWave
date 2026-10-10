@@ -74,6 +74,11 @@ public:
     bool m_pyroWaveChroma444;
     bool m_pyroWaveIntermediate16Bit;
     bool m_pyroWaveHighPriorityQueue;
+    bool m_pyroWaveMotionVectors = false;
+    bool m_pyroWaveMotionChoice = false;
+    uint32_t m_pyroWaveMotionLevel = 5; // NV_OF_PERF_LEVEL_SLOW
+    bool m_pyroWaveMotionBothDirections = true;
+    bool m_pyroWaveMotionQuarterResolution = false;
 
     uint32_t m_nvencTuningPreset;
     uint32_t m_nvencMultiPass;

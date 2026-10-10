@@ -548,6 +548,18 @@ void VideoEncoderPyroWave::Transmit(
             m_failed = true;
             return;
         }
+        if (Settings::Instance().m_pyroWaveMotionVectors) {
+            D3D11_TEXTURE2D_DESC sharedDesc;
+            m_sharedTexture->GetDesc(&sharedDesc);
+            // Vectors every 16 pixels: finer ones measured no better for the in-between frame
+            // (offline, 2026-10-07).
+            m_motion = std::make_unique<PyroWaveMotion>();
+            if (!m_motion->Initialize(
+                    m_d3dRender->GetDevice(), m_d3dRender->GetContext(), sharedDesc.Format, m_width, m_height, 16
+                )) {
+                m_motion.reset();
+            }
+        }
     }
 
     // Results of earlier frames. The timers belong to the present thread again once the input
@@ -570,6 +582,15 @@ void VideoEncoderPyroWave::Transmit(
     m_context4->Signal(m_fence.Get(), copiedValue);
     // Vulkan waits for the signal above, so it must reach the GPU now, not at some later flush.
     context->Flush();
+    if (m_motion) {
+        // Optical flow against the previous frame, on its own unit, while PyroWave encodes. Queued
+        // after the signal: in front of it, the encode waited for the flow (its input conversion,
+        // the flow and the read-back copies), 4-5 ms per frame at 7040x2496 (2026-10-09), and the
+        // encoder thread then took longer than a 45 fps frame period.
+        m_motion->Submit(pTexture, targetTimestampNs);
+        // Collect polls without flushing.
+        context->Flush();
+    }
     uint64_t readValue = ++m_fenceValue;
     const Clock::time_point copySubmitted = Clock::now();
 
@@ -666,7 +687,17 @@ void VideoEncoderPyroWave::Transmit(
     const bool pad = Settings::Instance().m_pyroWavePadPackets;
     size_t frameBytes = 0;
     Clock::time_point firstQueued = planned;
+    // The motion packets go out between two pieces as soon as they are ready, so the frame itself
+    // never waits for them.
+    bool motionSent = m_motion == nullptr;
+    // The motion choice follows the vectors (the GPU makes it right after them).
+    bool choiceSent = m_motion == nullptr;
     for (size_t first = 0; first < packetCount;) {
+        if (!motionSent && first > 0) {
+            motionSent = SendMotionPackets(targetTimestampNs, false);
+        } else if (!choiceSent && first > 0) {
+            choiceSent = SendChoicePackets(targetTimestampNs, false);
+        }
         size_t end = first;
         size_t pieceBytes = 0;
         while (end < packetCount && (end == first || pieceBytes < kSendPieceBytes)) {
@@ -700,6 +731,33 @@ void VideoEncoderPyroWave::Transmit(
         first = end;
     }
 
+    if (!motionSent || !choiceSent) {
+        // Not ready while the frame went out: they still help the headset if they follow
+        // closely (it holds the frame back up to a display period for them). The frame is out
+        // already, so waiting here costs it no latency, only this thread's time until the next
+        // frame: at 7040x2496 the flow takes 14-20 ms (2026-10-09), and the frame is out after
+        // about 15, so the 4 ms of 90 Hz were too short at 45 fps.
+        // The choice shares the budget.
+        const int refreshRate = Settings::Instance().m_refreshRate;
+        const double periodMs = 1000.0 / (refreshRate > 0 ? refreshRate : 90);
+        auto budgetMs = [&] { return std::clamp(0.9 * periodMs - MsBetween(ready, Clock::now()), 4.0, 30.0); };
+        if (!motionSent) {
+            motionSent = SendMotionPackets(targetTimestampNs, true, budgetMs());
+        }
+        // The choice is ready about 0.5 ms after the vectors: it may take up to the frame period,
+        // and at least 1 ms after late vectors (dropping it then lost most choices, 2026-10-10).
+        // Waiting much past the period would hold up the next frame.
+        const double choiceBudgetMs = std::max(periodMs - MsBetween(ready, Clock::now()), 1.0);
+        if (motionSent && !choiceSent) {
+            SendChoicePackets(targetTimestampNs, true, choiceBudgetMs);
+        }
+    }
+    if (m_motion) {
+        // Never sent with a later frame.
+        m_motion->DiscardChoice();
+        m_motion->ReportIfDue();
+    }
+
     const Clock::time_point sent = Clock::now();
 
     const double phaseMs[kPhaseCount] = {
@@ -714,6 +772,46 @@ void VideoEncoderPyroWave::Transmit(
         MsBetween(ready, sent),
     };
     ReportTiming(phaseMs, frameBytes, packetCount);
+}
+
+bool VideoEncoderPyroWave::SendMotionPackets(uint64_t targetTimestampNs, bool wait, double waitMs) {
+    m_motionBuffer.clear();
+    m_motionSizes.clear();
+    if (!m_motion->Collect(
+            wait, waitMs, (uint16_t)m_geometry.stripe_count(), m_packetBytes, m_motionBuffer, m_motionSizes
+        )) {
+        return false;
+    }
+    VideoSendPackets(
+        targetTimestampNs,
+        m_motionBuffer.data(),
+        m_motionSizes.data(),
+        (unsigned int)m_motionSizes.size(),
+        true,
+        false,
+        false
+    );
+    return true;
+}
+
+bool VideoEncoderPyroWave::SendChoicePackets(uint64_t targetTimestampNs, bool wait, double waitMs) {
+    m_motionBuffer.clear();
+    m_motionSizes.clear();
+    if (!m_motion->CollectChoice(
+            wait, waitMs, (uint16_t)m_geometry.stripe_count(), m_packetBytes, m_motionBuffer, m_motionSizes
+        )) {
+        return false;
+    }
+    VideoSendPackets(
+        targetTimestampNs,
+        m_motionBuffer.data(),
+        m_motionSizes.data(),
+        (unsigned int)m_motionSizes.size(),
+        true,
+        false,
+        false
+    );
+    return true;
 }
 
 void VideoEncoderPyroWave::ReportTiming(
@@ -853,6 +951,7 @@ void VideoEncoderPyroWave::ReportTiming(
 }
 
 void VideoEncoderPyroWave::ReleaseResources() {
+    m_motion.reset();
     // PyroWave waits for the GPU to be idle before destroying anything.
     if (m_encoder) {
         m_api.encoder_destroy(m_encoder);

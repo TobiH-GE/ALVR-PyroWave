@@ -134,3 +134,19 @@ void FFR::Render() {
 }
 
 ID3D11Texture2D* FFR::GetOutputTexture() { return mOptimizedTexture.Get(); }
+
+bool FFR::GetFoveation(float centerSize[2], float centerShift[2], float edgeRatio[2], float eyeSizeRatio[2]) {
+    if (!Settings::Instance().m_enableFoveatedEncoding) {
+        return false;
+    }
+    const auto v = CalculateFoveationVars();
+    centerSize[0] = v.centerSizeX;
+    centerSize[1] = v.centerSizeY;
+    centerShift[0] = v.centerShiftX;
+    centerShift[1] = v.centerShiftY;
+    edgeRatio[0] = v.edgeRatioX;
+    edgeRatio[1] = v.edgeRatioY;
+    eyeSizeRatio[0] = v.eyeWidthRatio;
+    eyeSizeRatio[1] = v.eyeHeightRatio;
+    return true;
+}
