@@ -12,6 +12,7 @@
 #pragma once
 
 #include <vector>
+#include <functional>
 #include "alvr_server/nvEncodeAPI.h"
 #include <stdint.h>
 #include <mutex>
@@ -125,6 +126,16 @@ public:
     *  GetNextInputFrame() function.
     */
     virtual void EncodeFrame(std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_PIC_PARAMS *pPicParams = nullptr);
+
+    // As above; afterSubmit runs once the frame is queued on the encoder, before waiting for its
+    // output (ALVR: queues the optical flow behind the encode, see FrameMotion.h).
+    void EncodeFrame(std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_PIC_PARAMS *pPicParams,
+                     const std::function<void()> &afterSubmit);
+
+    // EncodeFrame in two steps (ALVR, eyes encoded separately): queues the frame on the encoder,
+    // then waits for its output, so several encoders can work at the same time.
+    void SubmitFrame(NV_ENC_PIC_PARAMS *pPicParams);
+    void CollectFrame(std::vector<std::vector<uint8_t>> &vPacket);
 
     /**
     *  @brief  This function to flush the encoder queue.

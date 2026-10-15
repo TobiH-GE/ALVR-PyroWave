@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "bindings.h"
 #include <mutex>
+#include <vector>
 #include <string.h>
 
 static const char NAL_PREFIX_3B[] = { 0x00, 0x00, 0x01 };
@@ -115,4 +116,34 @@ void ParseFrameNals(
     }
 
     VideoSend(targetTimestampNs, buf, len, isIdr);
+}
+
+void ParseFrameNalsOfEye(
+    int codec,
+    unsigned char* buf,
+    int len,
+    unsigned long long targetTimestampNs,
+    bool isIdr,
+    int eye,
+    bool firstPiece,
+    bool lastPiece
+) {
+    if ((unsigned)len < sizeof(NAL_PREFIX_4B)) {
+        return;
+    }
+    // Both halves carry the same configuration (same size and settings), sent once per IDR.
+    if (codec == ALVR_CODEC_H264) {
+        processH264Nals(buf, len);
+    } else if (codec == ALVR_CODEC_HEVC) {
+        processHevcNals(buf, len);
+    }
+    static std::vector<unsigned char> packet;
+    packet.resize(size_t(len) + 4);
+    packet[0] = SplitEyePrefix0;
+    packet[1] = SplitEyePrefix1;
+    packet[2] = 0;
+    packet[3] = (unsigned char)eye;
+    memcpy(packet.data() + 4, buf, size_t(len));
+    const unsigned int size = (unsigned int)packet.size();
+    VideoSendPackets(targetTimestampNs, packet.data(), &size, 1, isIdr, firstPiece, lastPiece);
 }

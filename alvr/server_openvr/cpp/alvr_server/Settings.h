@@ -97,6 +97,12 @@ public:
     int64_t m_nvencRcMaxBitrate;
     int64_t m_nvencRcAverageBitrate;
     bool m_nvencEnableWeightedPrediction;
+    // Foveated QP map: NVENC with HEVC or AV1 only, with foveated encoding (VideoEncoderNVENC).
+    bool m_nvencFoveatedQpMap = false;
+    int m_nvencCenterQpOffset = 0;
+    int m_nvencEdgeQpOffset = 0;
+    // NVENC, H.264/HEVC: an encoder per eye (VideoEncoderNVENC).
+    bool m_nvencSplitEyes = false;
 
     uint64_t m_minimumIdrIntervalMs;
 

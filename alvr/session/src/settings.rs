@@ -165,6 +165,36 @@ Temporal: Helps improve overall encoding quality, very small trade-off in speed.
     pub rc_average_bitrate: i64,
     #[schema(flag = "steamvr-restart")]
     pub enable_weighted_prediction: bool,
+    #[schema(strings(
+        display_name = "Foveated QP map",
+        help = r#"Only for NVENC with HEVC or AV1, and only with foveated encoding on (H.264, AMF and software encoding ignore it).
+Moves bits from the compressed edge into the full resolution center of each eye, at the same bitrate: the center is quantized finer, the edge coarser."#
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub foveated_qp_map: Switch<FoveatedQpMapConfig>,
+    #[schema(strings(
+        display_name = "Encode eyes separately",
+        help = r#"Only for NVENC with HEVC or H.264 (AV1 ignores it) and the visionOS client of this fork.
+Encodes the left and the right eye's half with an encoder each, at the same time, and sends the left half first: the headset decodes each half as soon as it is in, so the left one decodes while the right one is still on the way. Each half gets half the bitrate."#
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub split_eyes: bool,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+pub struct FoveatedQpMapConfig {
+    #[schema(strings(
+        display_name = "Center QP offset",
+        help = "Added to the QP the rate control chooses, in the full resolution center. Negative: finer, more bits. In HEVC QP steps (6 steps halve the quantizer step); AV1 gets 5 times the value on its finer scale."
+    ))]
+    #[schema(gui(slider(min = -12, max = 0)))]
+    pub center_qp_offset: i32,
+    #[schema(strings(
+        display_name = "Edge QP offset",
+        help = "Added to the QP the rate control chooses, in the compressed edge. Positive: coarser, fewer bits."
+    ))]
+    #[schema(gui(slider(min = 0, max = 12)))]
+    pub edge_qp_offset: i32,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
@@ -287,7 +317,7 @@ pub struct PyroWaveConfig {
 
     #[schema(strings(
         display_name = "Send motion vectors",
-        help = "Runs NVIDIA Optical Flow (the GPU's own optical flow unit, not the shader cores the game uses) on every frame against the previous one and sends the motion to the headset as a few extra packets per frame (about 130 KB at 4864x1728). The headset's Frame Interpolation (45 fps shown at 90 Hz) needs them. Needs an NVIDIA GPU; off leaves the stream exactly as before."
+        help = "Runs NVIDIA Optical Flow (the GPU's own optical flow unit, not the shader cores the game uses) on every frame against the previous one and sends the motion to the headset as a few extra packets per frame (about 130 KB at 4864x1728). The headset's Frame Interpolation (45 fps shown at 90 Hz) needs them. Needs an NVIDIA GPU; off leaves the stream exactly as before. Also for HEVC, AV1 and H.264 when NVENC encodes them (not AMF or software encoding): there the motion packets go out ahead of each frame. Mind the extra data on Wi-Fi: about 275 KB per frame at 7040x2496, 100 Mbit/s at 45 fps."
     ))]
     #[schema(flag = "steamvr-restart")]
     pub motion_vectors: bool,
@@ -1894,6 +1924,14 @@ pub fn session_settings_default() -> SettingsDefault {
                     rc_max_bitrate: -1,
                     rc_average_bitrate: -1,
                     enable_weighted_prediction: false,
+                    foveated_qp_map: SwitchDefault {
+                        enabled: false,
+                        content: FoveatedQpMapConfigDefault {
+                            center_qp_offset: -4,
+                            edge_qp_offset: 3,
+                        },
+                    },
+                    split_eyes: false,
                 },
                 quality_preset: EncoderQualityPresetDefault {
                     variant: EncoderQualityPresetDefaultVariant::Speed,

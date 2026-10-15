@@ -12,6 +12,10 @@ public:
     // center size and shift, the edge ratio and the eye size ratio, x then y. False when foveated
     // encoding is off (the arrays are then left as they are).
     static bool GetFoveation(float centerSize[2], float centerShift[2], float edgeRatio[2], float eyeSizeRatio[2]);
+    // The full resolution center in the encoded picture, as fractions of the left eye's half
+    // (x) and of the height (y), from lo to hi; the right eye's half is mirrored horizontally.
+    // False when foveated encoding is off.
+    static bool GetCenterSpan(float lo[2], float hi[2]);
     ID3D11Texture2D* GetOutputTexture();
 
 private:

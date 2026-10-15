@@ -71,6 +71,14 @@ pub mod video_send_stats {
     pub static QUEUED: AtomicUsize = AtomicUsize::new(0);
     pub static QUEUE_PEAK: AtomicUsize = AtomicUsize::new(0);
     pub static REFUSED: AtomicU64 = AtomicU64::new(0);
+    pub static AHEAD_SENT: AtomicU64 = AtomicU64::new(0);
+    pub static AHEAD_OF_PIECES: AtomicU64 = AtomicU64::new(0);
+
+    // Motion packets sent ahead, and how many frame pieces were still queued behind them.
+    pub fn sent_ahead(queued_pieces: usize) {
+        AHEAD_SENT.fetch_add(1, Ordering::Relaxed);
+        AHEAD_OF_PIECES.fetch_add(queued_pieces as u64, Ordering::Relaxed);
+    }
 
     pub fn queued() {
         let now = QUEUED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -100,14 +108,18 @@ pub mod video_send_stats {
         let longest = LONGEST_NS.swap(0, Ordering::Relaxed);
         let peak = QUEUE_PEAK.swap(QUEUED.load(Ordering::Relaxed), Ordering::Relaxed);
         let refused = REFUSED.swap(0, Ordering::Relaxed);
+        let ahead = AHEAD_SENT.swap(0, Ordering::Relaxed);
+        let ahead_of = AHEAD_OF_PIECES.swap(0, Ordering::Relaxed);
         let seconds = seconds.max(1e-3);
         format!(
             "{:.2} Gbps handed to the socket, send calls busy {:.0} % (longest {:.2} ms), queue to \
-             the send thread now {}, peak {peak} pieces, {refused} pieces refused",
+             the send thread now {}, peak {peak} pieces, {refused} pieces refused, {ahead} motion \
+             pieces sent ahead of {:.1} queued pieces on average",
             bytes as f64 * 8.0 / seconds / 1e9,
             busy as f64 / 1e9 / seconds * 100.0,
             longest as f64 / 1e6,
             QUEUED.load(Ordering::Relaxed),
+            ahead_of as f64 / ahead.max(1) as f64,
         )
     }
 }
@@ -288,6 +300,11 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
     };
 
     let nvenc_overrides = settings.video.encoder_config.nvenc;
+    let (nvenc_foveated_qp_map, nvenc_center_qp_offset, nvenc_edge_qp_offset) =
+        match nvenc_overrides.foveated_qp_map.as_option() {
+            Some(config) => (true, config.center_qp_offset, config.edge_qp_offset),
+            None => (false, 0, 0),
+        };
     let amf_controls = settings.video.encoder_config.amf;
     let hdr_controls = settings.video.encoder_config.hdr;
 
@@ -377,6 +394,10 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         rc_max_bitrate: nvenc_overrides.rc_max_bitrate,
         rc_average_bitrate: nvenc_overrides.rc_average_bitrate,
         nvenc_enable_weighted_prediction: nvenc_overrides.enable_weighted_prediction,
+        nvenc_foveated_qp_map,
+        nvenc_center_qp_offset,
+        nvenc_edge_qp_offset,
+        nvenc_split_eyes: nvenc_overrides.split_eyes,
         capture_frame_dir: settings.extra.capture.capture_frame_dir,
         amd_bitrate_corruption_fix: settings.video.bitrate.image_corruption_fix,
         use_separate_hand_trackers,
@@ -1057,6 +1078,7 @@ fn connection_pipeline(
     let video_send_thread = thread::spawn({
         let client_hostname = client_hostname.clone();
         let frames_sent = Arc::clone(&frames_sent);
+        let ctx = Arc::clone(&ctx);
         move || {
             info!(
                 "Video send thread: {}",
@@ -1064,15 +1086,48 @@ fn connection_pipeline(
             );
             let mut last_frame_timestamp = None;
 
+            // The motion packets queued ahead (ConnectionContext::video_priority_queue), sent now.
+            let send_priority = |video_sender: &mut alvr_sockets::StreamSender<VideoPacketHeader>| {
+                loop {
+                    // Not in the loop condition: its lock would be held while sending.
+                    let next = ctx.video_priority_queue.lock().pop_front();
+                    let Some(piece) = next else { break };
+                    let mut bytes = 0;
+                    let mut buffers = Vec::with_capacity(piece.len());
+                    let mut payloads = Vec::with_capacity(piece.len());
+                    for VideoPacket { header, payload } in piece {
+                        let mut buffer = video_sender.get_buffer(&header).unwrap();
+                        buffer
+                            .get_range_mut(0, payload.len())
+                            .copy_from_slice(&payload);
+                        buffers.push(buffer);
+                        bytes += payload.len();
+                        payloads.push(payload);
+                    }
+                    let started = Instant::now();
+                    video_sender.send_many(buffers).ok();
+                    video_send_stats::sent(bytes, started.elapsed());
+                    video_send_stats::sent_ahead(
+                        video_send_stats::QUEUED.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    recycle_packet_buffers(payloads);
+                }
+            };
+
             let mut segmentation_reported = false;
             while is_streaming(&client_hostname) {
                 // One entry per frame, a single packet for H.264/HEVC/AV1, or per piece of a frame,
-                // many packets for PyroWave (see send_video_frame_piece).
+                // many packets for PyroWave (see send_video_frame_piece). An empty entry only
+                // wakes this thread for motion packets queued ahead.
                 let packets = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
                     Ok(packets) => packets,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
+                send_priority(&mut video_sender);
+                if packets.is_empty() {
+                    continue;
+                }
                 video_send_stats::dequeued();
                 // A PyroWave frame arrives in several pieces with the same timestamp.
                 if let Some(first) = packets.first() {
@@ -1102,12 +1157,14 @@ fn connection_pipeline(
                         video_sender.send_many(buffers.drain(..)).ok();
                         video_send_stats::sent(chunk_bytes, started.elapsed());
                         chunk_bytes = 0;
+                        send_priority(&mut video_sender);
                     }
                 }
                 let started = Instant::now();
                 video_sender.send_many(buffers).ok();
                 video_send_stats::sent(chunk_bytes, started.elapsed());
                 recycle_packet_buffers(payloads);
+                send_priority(&mut video_sender);
 
                 // Whether Windows took UDP segmentation offload is only known after a send.
                 if !segmentation_reported {

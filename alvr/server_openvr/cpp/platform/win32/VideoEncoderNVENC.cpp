@@ -1,9 +1,13 @@
 #include "VideoEncoderNVENC.h"
+#include "FFR.h"
 #include "NvCodecUtils.h"
 
 #include "alvr_server/Logger.h"
 #include "alvr_server/Settings.h"
 #include "alvr_server/Utils.h"
+
+#include <algorithm>
+#include <cmath>
 
 VideoEncoderNVENC::VideoEncoderNVENC(std::shared_ptr<CD3DRender> pD3DRender, int width, int height)
     : m_pD3DRender(pD3DRender)
@@ -16,10 +20,32 @@ VideoEncoderNVENC::VideoEncoderNVENC(std::shared_ptr<CD3DRender> pD3DRender, int
 VideoEncoderNVENC::~VideoEncoderNVENC() { }
 
 void VideoEncoderNVENC::Initialize() {
-    //
-    // Initialize Encoder
-    //
+    // "Encode eyes separately": an encoder per eye, each on half the width and half the bitrate.
+    // H.264 and HEVC only (the client builds a decoder per eye from the one configuration both
+    // halves share; AV1 sets its decoder up differently there).
+    m_splitEyes = Settings::Instance().m_nvencSplitEyes
+        && (m_codec == ALVR_CODEC_HEVC || m_codec == ALVR_CODEC_H264) && m_renderWidth % 4 == 0;
+    if (Settings::Instance().m_nvencSplitEyes && !m_splitEyes) {
+        Warn("Encode eyes separately: only for H.264 and HEVC, encoding the whole frame\n");
+    }
+    m_encodeWidth = m_splitEyes ? m_renderWidth / 2 : m_renderWidth;
 
+    BuildQpDeltaMap(0, m_encodeWidth, m_qpDeltaMap);
+    if (m_splitEyes) {
+        BuildQpDeltaMap(m_encodeWidth, m_encodeWidth, m_qpDeltaMapRight);
+    }
+
+    const uint64_t bitrate = m_bitrateInMBits * 1'000'000L / (m_splitEyes ? 2 : 1);
+    CreateEncoder(m_NvNecoder, m_encodeWidth, bitrate);
+    if (m_splitEyes) {
+        CreateEncoder(m_NvNecoderRight, m_encodeWidth, bitrate);
+        Info("Encode eyes separately: two encoders of %dx%d\n", m_encodeWidth, m_renderHeight);
+    }
+
+    Debug("CNvEncoder is successfully initialized.\n");
+}
+
+void VideoEncoderNVENC::CreateEncoder(std::shared_ptr<NvEncoder>& encoder, int width, uint64_t bitrate_bps) {
     NV_ENC_BUFFER_FORMAT format
         = Settings::Instance().m_enableHdr ? NV_ENC_BUFFER_FORMAT_NV12 : NV_ENC_BUFFER_FORMAT_ABGR;
 
@@ -28,17 +54,10 @@ void VideoEncoderNVENC::Initialize() {
                                                   : NV_ENC_BUFFER_FORMAT_ABGR10;
     }
 
-    Debug(
-        "Initializing CNvEncoder. Width=%d Height=%d Format=%d\n",
-        m_renderWidth,
-        m_renderHeight,
-        format
-    );
+    Debug("Initializing CNvEncoder. Width=%d Height=%d Format=%d\n", width, m_renderHeight, format);
 
     try {
-        m_NvNecoder = std::make_shared<NvEncoderD3D11>(
-            m_pD3DRender->GetDevice(), m_renderWidth, m_renderHeight, format, 0
-        );
+        encoder = std::make_shared<NvEncoderD3D11>(m_pD3DRender->GetDevice(), width, m_renderHeight, format, 0);
     } catch (NVENCException e) {
         throw MakeException(
             "NvEnc NvEncoderD3D11 failed. Code=%d %hs\n", e.getErrorCode(), e.what()
@@ -49,15 +68,9 @@ void VideoEncoderNVENC::Initialize() {
     NV_ENC_CONFIG encodeConfig = { NV_ENC_CONFIG_VER };
     initializeParams.encodeConfig = &encodeConfig;
 
-    FillEncodeConfig(
-        initializeParams,
-        m_refreshRate,
-        m_renderWidth,
-        m_renderHeight,
-        m_bitrateInMBits * 1'000'000L
-    );
+    FillEncodeConfig(initializeParams, m_refreshRate, width, m_renderHeight, bitrate_bps, encoder.get());
     try {
-        m_NvNecoder->CreateEncoder(&initializeParams);
+        encoder->CreateEncoder(&initializeParams);
     } catch (NVENCException e) {
         if (e.getErrorCode() == NV_ENC_ERR_INVALID_PARAM) {
             throw MakeException(
@@ -66,23 +79,22 @@ void VideoEncoderNVENC::Initialize() {
         }
         throw MakeException("NvEnc CreateEncoder failed. Code=%d %hs", e.getErrorCode(), e.what());
     }
-
-    Debug("CNvEncoder is successfully initialized.\n");
 }
 
 void VideoEncoderNVENC::Shutdown() {
-    std::vector<std::vector<uint8_t>> vPacket;
-    if (m_NvNecoder)
-        m_NvNecoder->EndEncode(vPacket);
-
-    for (std::vector<uint8_t>& packet : vPacket) {
-        if (fpOut) {
-            fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
+    for (auto* encoder : { &m_NvNecoder, &m_NvNecoderRight }) {
+        if (!*encoder) {
+            continue;
         }
-    }
-    if (m_NvNecoder) {
-        m_NvNecoder->DestroyEncoder();
-        m_NvNecoder.reset();
+        std::vector<std::vector<uint8_t>> vPacket;
+        (*encoder)->EndEncode(vPacket);
+        for (std::vector<uint8_t>& packet : vPacket) {
+            if (fpOut) {
+                fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
+            }
+        }
+        (*encoder)->DestroyEncoder();
+        encoder->reset();
     }
 
     Debug("CNvEncoder::Shutdown\n");
@@ -98,39 +110,122 @@ void VideoEncoderNVENC::Transmit(
     auto params = GetDynamicEncoderParams();
     if (params.updated) {
         m_bitrateInMBits = params.bitrate_bps / 1'000'000;
-        NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
-        NV_ENC_CONFIG encodeConfig = { NV_ENC_CONFIG_VER };
-        initializeParams.encodeConfig = &encodeConfig;
-        FillEncodeConfig(
-            initializeParams,
-            params.framerate,
-            m_renderWidth,
-            m_renderHeight,
-            m_bitrateInMBits * 1'000'000L
-        );
-        NV_ENC_RECONFIGURE_PARAMS reconfigureParams = { NV_ENC_RECONFIGURE_PARAMS_VER };
-        reconfigureParams.reInitEncodeParams = initializeParams;
-        m_NvNecoder->Reconfigure(&reconfigureParams);
+        for (auto* encoder : { &m_NvNecoder, &m_NvNecoderRight }) {
+            if (!*encoder) {
+                continue;
+            }
+            NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
+            NV_ENC_CONFIG encodeConfig = { NV_ENC_CONFIG_VER };
+            initializeParams.encodeConfig = &encodeConfig;
+            FillEncodeConfig(
+                initializeParams,
+                params.framerate,
+                m_encodeWidth,
+                m_renderHeight,
+                m_bitrateInMBits * 1'000'000L / (m_splitEyes ? 2 : 1),
+                encoder->get()
+            );
+            NV_ENC_RECONFIGURE_PARAMS reconfigureParams = { NV_ENC_RECONFIGURE_PARAMS_VER };
+            reconfigureParams.reInitEncodeParams = initializeParams;
+            (*encoder)->Reconfigure(&reconfigureParams);
+        }
     }
 
-    std::vector<std::vector<uint8_t>> vPacket;
-
-    const NvEncInputFrame* encoderInputFrame = m_NvNecoder->GetNextInputFrame();
-
-    ID3D11Texture2D* pInputTexture
-        = reinterpret_cast<ID3D11Texture2D*>(encoderInputFrame->inputPtr);
-    m_pD3DRender->GetContext()->CopyResource(pInputTexture, pTexture);
-
-    NV_ENC_PIC_PARAMS picParams = {};
+    auto picParamsFor = [&](std::vector<int8_t>& map) {
+        NV_ENC_PIC_PARAMS picParams = {};
+        if (insertIDR) {
+            picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+        }
+        if (!map.empty()) {
+            picParams.qpDeltaMap = map.data();
+            picParams.qpDeltaMapSize = (uint32_t)map.size();
+        }
+        return picParams;
+    };
     if (insertIDR) {
         Debug("Inserting IDR frame.\n");
-        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
     }
-    m_NvNecoder->EncodeFrame(vPacket, &picParams);
+    std::vector<std::vector<uint8_t>> vPacket;
+#ifdef ALVR_PYROWAVE
+    const bool motion = FrameMotion::Enabled();
+#else
+    const bool motion = false;
+#endif
 
-    for (std::vector<uint8_t>& packet : vPacket) {
-        uint8_t* buf = packet.data();
-        int len = (int)packet.size();
+    if (m_splitEyes) {
+        // Both halves are queued before either is waited for, so the two encoders run at the same
+        // time; the left half goes out as soon as it is done.
+        auto* context = m_pD3DRender->GetContext();
+        for (int eye = 0; eye < 2; eye++) {
+            auto& encoder = eye == 0 ? m_NvNecoder : m_NvNecoderRight;
+            const NvEncInputFrame* input = encoder->GetNextInputFrame();
+            D3D11_BOX box = { UINT(eye * m_encodeWidth), 0, 0, UINT((eye + 1) * m_encodeWidth), UINT(m_renderHeight), 1 };
+            context->CopySubresourceRegion(
+                reinterpret_cast<ID3D11Texture2D*>(input->inputPtr), 0, 0, 0, 0, pTexture, 0, &box
+            );
+        }
+        NV_ENC_PIC_PARAMS left = picParamsFor(m_qpDeltaMap), right = picParamsFor(m_qpDeltaMapRight);
+        m_NvNecoder->SubmitFrame(&left);
+        m_NvNecoderRight->SubmitFrame(&right);
+#ifdef ALVR_PYROWAVE
+        if (motion) {
+            m_frameMotion.Submit(m_pD3DRender->GetDevice(), context, pTexture, targetTimestampNs);
+        }
+#endif
+        // Every read of the composed texture is queued (the halves' copies, the optical flow's
+        // copy) ahead of anything the present thread records next: SteamVR may compose the next
+        // frame now. It waited for this thread up to 12 ms while the frame waited for its motion
+        // vectors at 50 Hz (2026-10-13), which made frames late.
+        ReleaseInput();
+#ifdef ALVR_PYROWAVE
+        if (motion) {
+            m_frameMotion.SendBeforeFrame(targetTimestampNs, m_frameReadyTime);
+        }
+#endif
+        m_NvNecoder->CollectFrame(vPacket);
+        SendPackets(vPacket, targetTimestampNs, insertIDR, 0);
+        m_NvNecoderRight->CollectFrame(vPacket);
+        SendPackets(vPacket, targetTimestampNs, insertIDR, 1);
+    } else {
+        const NvEncInputFrame* encoderInputFrame = m_NvNecoder->GetNextInputFrame();
+        ID3D11Texture2D* pInputTexture = reinterpret_cast<ID3D11Texture2D*>(encoderInputFrame->inputPtr);
+        m_pD3DRender->GetContext()->CopyResource(pInputTexture, pTexture);
+
+        NV_ENC_PIC_PARAMS picParams = picParamsFor(m_qpDeltaMap);
+#ifdef ALVR_PYROWAVE
+        if (motion) {
+            // The optical flow of this frame, queued once the encode is (so the encode never waits
+            // for it on the GPU); its packets go out with the frame (FrameMotion.h).
+            m_NvNecoder->EncodeFrame(vPacket, &picParams, [&] {
+                m_frameMotion.Submit(m_pD3DRender->GetDevice(), m_pD3DRender->GetContext(), pTexture, targetTimestampNs);
+                // The composed texture is read by queued copies only from here on (as above).
+                ReleaseInput();
+            });
+            m_frameMotion.SendBeforeFrame(targetTimestampNs, m_frameReadyTime);
+        } else {
+            ReleaseInput();
+            m_NvNecoder->EncodeFrame(vPacket, &picParams);
+        }
+#else
+        ReleaseInput();
+        m_NvNecoder->EncodeFrame(vPacket, &picParams);
+#endif
+        SendPackets(vPacket, targetTimestampNs, insertIDR, -1);
+    }
+#ifdef ALVR_PYROWAVE
+    if (motion) {
+        m_frameMotion.SendAfterFrame(targetTimestampNs, m_frameReadyTime);
+    }
+#endif
+}
+
+// eye -1: the whole frame; 0 or 1: that eye's half, the left one first.
+void VideoEncoderNVENC::SendPackets(
+    std::vector<std::vector<uint8_t>>& packets, uint64_t targetTimestampNs, bool insertIDR, int eye
+) {
+    for (size_t i = 0; i < packets.size(); i++) {
+        uint8_t* buf = packets[i].data();
+        int len = (int)packets[i].size();
 
         // NVENC's AV1 encoding includes a bunch of IVF wrapping,
         // so we need to strip it down to just the OBUs
@@ -151,11 +246,17 @@ void VideoEncoderNVENC::Transmit(
             continue;
         }
 
-        if (fpOut) {
-            fpOut.write(reinterpret_cast<char*>(buf), len);
+        if (eye < 0) {
+            if (fpOut) {
+                fpOut.write(reinterpret_cast<char*>(buf), len);
+            }
+            ParseFrameNals(m_codec, buf, len, targetTimestampNs, insertIDR);
+        } else {
+            ParseFrameNalsOfEye(
+                m_codec, buf, len, targetTimestampNs, insertIDR, eye, eye == 0 && i == 0,
+                eye == 1 && i + 1 == packets.size()
+            );
         }
-
-        ParseFrameNals(m_codec, buf, len, targetTimestampNs, insertIDR);
     }
 }
 
@@ -164,7 +265,8 @@ void VideoEncoderNVENC::FillEncodeConfig(
     int refreshRate,
     int renderWidth,
     int renderHeight,
-    uint64_t bitrate_bps
+    uint64_t bitrate_bps,
+    NvEncoder* encoder
 ) {
     auto& encodeConfig = *initializeParams.encodeConfig;
 
@@ -212,7 +314,7 @@ void VideoEncoderNVENC::FillEncodeConfig(
     NV_ENC_TUNING_INFO tuningPreset
         = static_cast<NV_ENC_TUNING_INFO>(Settings::Instance().m_nvencTuningPreset);
 
-    m_NvNecoder->CreateDefaultEncoderParams(
+    (encoder ? encoder : m_NvNecoder.get())->CreateDefaultEncoderParams(
         &initializeParams, encoderGUID, qualityPreset, tuningPreset
     );
 
@@ -400,6 +502,9 @@ void VideoEncoderNVENC::FillEncodeConfig(
     } else if (Settings::Instance().m_nvencAdaptiveQuantizationMode == TemporalAQ) {
         encodeConfig.rcParams.enableTemporalAQ = 1;
     }
+    if (!m_qpDeltaMap.empty()) {
+        encodeConfig.rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA;
+    }
 
     if (Settings::Instance().m_nvencRateControlMode != -1) {
         encodeConfig.rcParams.rateControlMode
@@ -417,4 +522,72 @@ void VideoEncoderNVENC::FillEncodeConfig(
     if (Settings::Instance().m_nvencRcAverageBitrate != -1) {
         encodeConfig.rcParams.averageBitRate = Settings::Instance().m_nvencRcAverageBitrate;
     }
+}
+
+void VideoEncoderNVENC::BuildQpDeltaMap(int x0, int width, std::vector<int8_t>& map) {
+    map.clear();
+    const auto& settings = Settings::Instance();
+    if (!settings.m_nvencFoveatedQpMap) {
+        return;
+    }
+    // NVENC takes one value per CTB for HEVC (always 32x32) and per superblock for AV1 (64x64).
+    // The settings are in HEVC QP steps (0-51); AV1's quantizer index runs 0-255, so its offsets
+    // are scaled by 5 (measured on a capture: -4/+3 gives HEVC +1.6 dB in the center, AV1 with
+    // -20/+15 +1.1 dB, with -4/+3 only +0.3 dB).
+    int block, scale;
+    switch (m_codec) {
+    case ALVR_CODEC_HEVC:
+        block = 32;
+        scale = 1;
+        break;
+    case ALVR_CODEC_AV1:
+        block = 64;
+        scale = 5;
+        break;
+    default:
+        Warn("Foveated QP map: only for HEVC and AV1, not used\n");
+        return;
+    }
+    float lo[2], hi[2];
+    if (!FFR::GetCenterSpan(lo, hi)) {
+        Warn("Foveated QP map: needs foveated encoding, not used\n");
+        return;
+    }
+    const int cols = (width + block - 1) / block;
+    const int rows = (m_renderHeight + block - 1) / block;
+    const float eyeWidth = m_renderWidth / 2.f;
+    // The two centers in pixels, the right one mirrored (TextureToEyeUV).
+    const float y0 = lo[1] * m_renderHeight, y1 = hi[1] * m_renderHeight;
+    const float centers[2][2] = { { lo[0] * eyeWidth, hi[0] * eyeWidth },
+                                  { m_renderWidth - hi[0] * eyeWidth, m_renderWidth - lo[0] * eyeWidth } };
+    // The offsets blend over two blocks across the center's border, so no hard step shows.
+    const float ramp = 2.f * block;
+    const int center = settings.m_nvencCenterQpOffset * scale, edge = settings.m_nvencEdgeQpOffset * scale;
+    map.resize(size_t(cols) * rows);
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            const float px = x0 + (c + 0.5f) * block, py = (r + 0.5f) * block;
+            const float(&span)[2] = centers[px < eyeWidth ? 0 : 1];
+            // Signed distance to the center rectangle, negative inside.
+            const float dx = std::max(span[0] - px, px - span[1]);
+            const float dy = std::max(y0 - py, py - y1);
+            const float outside = std::hypot(std::max(dx, 0.f), std::max(dy, 0.f));
+            const float distance = outside > 0.f ? outside : std::max(dx, dy);
+            const float t = std::clamp(0.5f - distance / ramp, 0.f, 1.f);
+            map[size_t(r) * cols + c] = (int8_t)std::lround(edge + (center - edge) * t);
+        }
+    }
+    Info(
+        "Foveated QP map: %dx%d blocks of %d from x %d, center %+d, edge %+d, center x %.0f-%.0f y %.0f-%.0f\n",
+        cols,
+        rows,
+        block,
+        x0,
+        center,
+        edge,
+        centers[0][0],
+        centers[0][1],
+        y0,
+        y1
+    );
 }

@@ -181,6 +181,21 @@ extern "C" void CaptureFrame();
 void ParseFrameNals(
     int codec, unsigned char* buf, int len, unsigned long long targetTimestampNs, bool isIdr
 );
+// One eye's half of a frame encoded on its own (NVENC "Encode eyes separately", H.264/HEVC): as
+// ParseFrameNals, but sent as one piece of the frame behind a 4 byte prefix
+// (SplitEyePrefix0, SplitEyePrefix1, 0, eye), the left eye first.
+static const unsigned char SplitEyePrefix0 = 0xff;
+static const unsigned char SplitEyePrefix1 = 0xfe;
+void ParseFrameNalsOfEye(
+    int codec,
+    unsigned char* buf,
+    int len,
+    unsigned long long targetTimestampNs,
+    bool isIdr,
+    int eye,
+    bool firstPiece,
+    bool lastPiece
+);
 
 // CrashHandler.cpp
 void HookCrashHandler();

@@ -150,3 +150,18 @@ bool FFR::GetFoveation(float centerSize[2], float centerShift[2], float edgeRati
     eyeSizeRatio[1] = v.eyeHeightRatio;
     return true;
 }
+
+bool FFR::GetCenterSpan(float lo[2], float hi[2]) {
+    float centerSize[2], centerShift[2], edgeRatio[2], eyeSizeRatio[2];
+    if (!GetFoveation(centerSize, centerShift, edgeRatio, eyeSizeRatio)) {
+        return false;
+    }
+    // The bounds of the center in CompressAxisAlignedPixelShader.hlsl, scaled to the aligned eye.
+    for (int i = 0; i < 2; i++) {
+        const float c0 = (1.f - centerSize[i]) / 2.f;
+        const float c2 = (edgeRatio[i] - 1.f) * centerSize[i] + 1.f;
+        lo[i] = c0 * (centerShift[i] + 1.f) / c2 * eyeSizeRatio[i];
+        hi[i] = (c0 * (centerShift[i] - 1.f) / c2 + 1.f) * eyeSizeRatio[i];
+    }
+    return true;
+}

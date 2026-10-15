@@ -116,6 +116,118 @@ void QuatToMatrix(const float q[4], float m[9]) {
     m[6] = 2 * (x * z - y * w);     m[7] = 2 * (y * z + x * w);     m[8] = 1 - 2 * (x * x + y * y);
 }
 
+// --- Compact rows (MotionVersion 2, MotionChoiceVersion 2; format in PyroWaveStripes.h) ---
+
+void PutVarint(std::vector<uint8_t>& out, int32_t value) {
+    uint32_t zigzag = (uint32_t(value) << 1) ^ uint32_t(value >> 31);
+    while (zigzag >= 0x80) {
+        out.push_back(uint8_t(zigzag | 0x80));
+        zigzag >>= 7;
+    }
+    out.push_back(uint8_t(zigzag));
+}
+
+// One row of vectors (int16 x, y per cell, already in steps of MotionStep).
+void EncodeMotionRow(const int16_t* cells, int width, std::vector<uint8_t>& out) {
+    int32_t px = 0, py = 0; // the last reliable vector of the row, in steps
+    for (int x = 0; x < width;) {
+        const int16_t* c = cells + 2 * x;
+        if (c[0] == PyroWaveStripes::MotionUnreliable) {
+            int n = 1;
+            while (n < 64 && x + n < width && cells[2 * (x + n)] == PyroWaveStripes::MotionUnreliable) {
+                n++;
+            }
+            out.push_back(uint8_t(n - 1));
+            x += n;
+            continue;
+        }
+        const int32_t vx = c[0] / PyroWaveStripes::MotionStep, vy = c[1] / PyroWaveStripes::MotionStep;
+        if (vx == px && vy == py) {
+            int n = 1;
+            while (n < 64 && x + n < width && cells[2 * (x + n)] / PyroWaveStripes::MotionStep == px
+                   && cells[2 * (x + n)] != PyroWaveStripes::MotionUnreliable
+                   && cells[2 * (x + n) + 1] / PyroWaveStripes::MotionStep == py) {
+                n++;
+            }
+            out.push_back(uint8_t(0x40 + n - 1));
+            x += n;
+            continue;
+        }
+        const int32_t dx = vx - px, dy = vy - py;
+        if (dx >= -4 && dx <= 3 && dy >= -4 && dy <= 3) {
+            out.push_back(uint8_t(0x80 | ((dx + 4) << 3) | (dy + 4)));
+        } else {
+            out.push_back(0xc0);
+            PutVarint(out, dx);
+            PutVarint(out, dy);
+        }
+        px = vx;
+        py = vy;
+        x++;
+    }
+}
+
+// One row of the motion choice (one value 0-2 per block).
+void EncodeChoiceRow(const uint8_t* values, int width, std::vector<uint8_t>& out) {
+    for (int x = 0; x < width;) {
+        int n = 1;
+        while (n < 64 && x + n < width && values[x + n] == values[x]) {
+            n++;
+        }
+        out.push_back(uint8_t((values[x] << 6) | (n - 1)));
+        x += n;
+    }
+}
+
+// Packs the encoded rows (rows[i] for grid row i) into packets of at most maxPacketBytes, whole
+// rows each (a row longer than that alone), headed by prefix and header as given.
+void PackRows(
+    const std::vector<std::vector<uint8_t>>& rows,
+    PyroWaveStripes::PacketPrefix prefix,
+    PyroWaveStripes::MotionHeader header,
+    size_t maxPacketBytes,
+    std::vector<uint8_t>& buffer,
+    std::vector<uint32_t>& sizes,
+    uint64_t& statBytes
+) {
+    const size_t overhead = sizeof(PyroWaveStripes::PacketPrefix) + sizeof(PyroWaveStripes::MotionHeader);
+    const size_t budget = maxPacketBytes > overhead ? maxPacketBytes - overhead : 1;
+    // Rows per packet first, so packet_count is known before writing.
+    std::vector<std::pair<int, int>> packets; // first row, row count
+    for (int r = 0; r < (int)rows.size();) {
+        int n = 0;
+        size_t bytes = 0;
+        while (r + n < (int)rows.size() && (n == 0 || bytes + rows[r + n].size() <= budget)) {
+            bytes += rows[r + n].size();
+            n++;
+        }
+        packets.push_back({ r, n });
+        r += n;
+    }
+    for (size_t p = 0; p < packets.size(); p++) {
+        size_t data = 0;
+        for (int r = packets[p].first; r < packets[p].first + packets[p].second; r++) {
+            data += rows[r].size();
+        }
+        prefix.packet_index = (uint32_t)p;
+        prefix.packet_count = (uint32_t)packets.size();
+        prefix.data_bytes = (uint32_t)(sizeof(header) + data);
+        header.first_row = (uint16_t)packets[p].first;
+        header.row_count = (uint16_t)packets[p].second;
+        const size_t start = buffer.size();
+        buffer.resize(start + overhead + data);
+        memcpy(buffer.data() + start, &prefix, sizeof(prefix));
+        memcpy(buffer.data() + start + sizeof(prefix), &header, sizeof(header));
+        size_t at = start + overhead;
+        for (int r = packets[p].first; r < packets[p].first + packets[p].second; r++) {
+            memcpy(buffer.data() + at, rows[r].data(), rows[r].size());
+            at += rows[r].size();
+        }
+        sizes.push_back((uint32_t)(overhead + data));
+        statBytes += overhead + data;
+    }
+}
+
 } // namespace
 
 
@@ -232,6 +344,67 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float n = CELL * CELL;
     const float mean = s / n;
     contrast[id.xy] = sqrt(max(s2 / n - mean * mean, 0.0));
+}
+)";
+    // The cells sent, made on the GPU from the optical flow output as Collect made them on the CPU
+    // (2-4 ms of the encoder thread, which the frame waited for, 2026-10-13): per cell the
+    // average of its FLOWK x FLOWK vectors that pass the forward-backward check, back to picture
+    // pixels (integer division as on the CPU), flat cells unreliable, rounded to MotionStep.
+    // xy the cell, z consistent vectors | checked vectors << 16, w 1 = none consistent, 2 = flat.
+    static const char kCellVectors[] = R"(
+cbuffer Params : register(b0) {
+    int check;
+    int scale;
+    float flatContrast;
+    int pad;
+};
+Texture2D<int2> forward : register(t0);
+Texture2D<int2> backward : register(t1);
+Texture2D<float> contrast : register(t2);
+RWTexture2D<int4> cells : register(u0);
+// lround: halves away from zero.
+int RoundAway(float v) {
+    return v >= 0 ? int(floor(v + 0.5)) : -int(floor(-v + 0.5));
+}
+int Quantize(int v) {
+    const int steps = v >= 0 ? (v + STEP / 2) / STEP : -((-v + STEP / 2) / STEP);
+    return clamp(steps * STEP, -32764, 32764);
+}
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint gw, gh, fw, fh;
+    cells.GetDimensions(gw, gh);
+    forward.GetDimensions(fw, fh);
+    if (id.x >= gw || id.y >= gh) return;
+    int sx = 0, sy = 0, n = 0, checked = 0;
+    const int y1 = min(int(id.y + 1) * FLOWK, int(fh));
+    for (int y = int(id.y) * FLOWK; y < y1; y++) {
+        for (int x = int(id.x) * FLOWK; x < int(id.x + 1) * FLOWK; x++) {
+            const int2 f = forward.Load(int3(x, y, 0));
+            if (check != 0) {
+                const float fx = f.x / 32.0, fy = f.y / 32.0;
+                const int bx = clamp(x + RoundAway(fx / 4.0), 0, int(fw) - 1);
+                const int by = clamp(y + RoundAway(fy / 4.0), 0, int(fh) - 1);
+                const int2 b = backward.Load(int3(bx, by, 0));
+                const float ex = fx + b.x / 32.0, ey = fy + b.y / 32.0;
+                checked++;
+                if (sqrt(ex * ex + ey * ey) > max(1.0, 0.15 * sqrt(fx * fx + fy * fy))) continue;
+            }
+            sx += f.x;
+            sy += f.y;
+            n++;
+        }
+    }
+    int4 o = int4(UNRELIABLE, 0, n | (checked << 16), 0);
+    if (n == 0) {
+        o.w = 1;
+    } else if (contrast[id.xy] < flatContrast) {
+        o.w = 2;
+    } else {
+        o.x = Quantize(clamp(sx * scale / n, -32767, 32767));
+        o.y = Quantize(clamp(sy * scale / n, -32767, 32767));
+    }
+    cells[id.xy] = o;
 }
 )";
     // The field the choice compares against, made on the GPU as the headset makes it from the
@@ -448,11 +621,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
     // SCALE: picture pixels per gray texel; CELL: gray texels per cell.
     const std::string scaleText = std::to_string(m_scale), cellText = std::to_string(cellPixels / m_scale);
+    // FLOWK: optical flow vectors per cell side; UNRELIABLE, STEP: as PyroWaveStripes.
+    const std::string flowKText = std::to_string(cellPixels / (kFlowGrid * m_scale));
+    const std::string unreliableText = std::to_string(int(PyroWaveStripes::MotionUnreliable));
+    const std::string stepText = std::to_string(int(PyroWaveStripes::MotionStep));
     struct Macro {
         const char* name;
         const char* definition;
     };
-    const Macro macros[] = { { "SCALE", scaleText.c_str() }, { "CELL", cellText.c_str() }, { nullptr, nullptr } };
+    const Macro macros[] = { { "SCALE", scaleText.c_str() },          { "CELL", cellText.c_str() },
+                             { "FLOWK", flowKText.c_str() },          { "UNRELIABLE", unreliableText.c_str() },
+                             { "STEP", stepText.c_str() },            { nullptr, nullptr } };
     auto build = [&](const char* source, size_t size, const char* name, ComPtr<ID3D11ComputeShader>& shader) {
         ComPtr<ID3DBlob> code, errors;
         const bool ok = compile
@@ -463,6 +642,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     };
     const bool shadersOk = build(kToGray, sizeof(kToGray) - 1, "ToGray", m_toGray)
         && build(kCellContrast, sizeof(kCellContrast) - 1, "CellContrast", m_cellContrast);
+    // Without it the cells are made on the CPU as before.
+    const bool cellsShaderOk = build(kCellVectors, sizeof(kCellVectors) - 1, "CellVectors", m_cellsCs);
     // Without it the vectors still go out, only the choice does not.
     const bool selectOk = build(kSelect, sizeof(kSelect) - 1, "SelectMotion", m_select)
         && build(kRotation, sizeof(kRotation) - 1, "RotationField", m_rotationCs)
@@ -562,7 +743,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     desc.Width = (UINT)m_gridWidth;
     desc.Height = (UINT)m_gridHeight;
     desc.Format = DXGI_FORMAT_R32_FLOAT;
-    desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_contrast))
         || FAILED(device->CreateUnorderedAccessView(m_contrast.Get(), nullptr, &m_contrastView))) {
         Error("PyroWave motion vectors: cannot create the contrast texture, not sending them\n");
@@ -604,6 +785,55 @@ void main(uint3 id : SV_DispatchThreadID) {
         Error("PyroWave motion vectors: cannot create the readback, not sending them\n");
         Release();
         return false;
+    }
+    {
+        // Diagnosis only: without them Submit simply does not time its stages.
+        D3D11_QUERY_DESC disjoint = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+        D3D11_QUERY_DESC stamp = { D3D11_QUERY_TIMESTAMP, 0 };
+        bool ok = SUCCEEDED(device->CreateQuery(&disjoint, &m_tsDisjoint));
+        for (auto& q : m_ts) {
+            ok = ok && SUCCEEDED(device->CreateQuery(&stamp, &q));
+        }
+        if (!ok) {
+            m_tsDisjoint.Reset();
+        }
+    }
+    // The cells on the GPU (kCellVectors): views of the flow and the contrast, the cells and their
+    // readback. Without them Collect makes the cells on the CPU from the flow readback.
+    {
+        D3D11_TEXTURE2D_DESC cd = {};
+        cd.Width = (UINT)m_gridWidth;
+        cd.Height = (UINT)m_gridHeight;
+        cd.MipLevels = 1;
+        cd.ArraySize = 1;
+        cd.Format = DXGI_FORMAT_R32G32B32A32_SINT;
+        cd.SampleDesc.Count = 1;
+        cd.Usage = D3D11_USAGE_DEFAULT;
+        cd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        D3D11_TEXTURE2D_DESC sd = cd;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        D3D11_BUFFER_DESC pd = {};
+        pd.ByteWidth = 16;
+        pd.Usage = D3D11_USAGE_IMMUTABLE;
+        pd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        struct CellParams {
+            int check;
+            int scale;
+            float flatContrast;
+            int pad;
+        } params = { m_bidirectional ? 1 : 0, m_scale, kFlatContrast, 0 };
+        D3D11_SUBRESOURCE_DATA pdData = { &params, 0, 0 };
+        m_gpuCells = cellsShaderOk && outputFormats[0] == DXGI_FORMAT_R16G16_SINT
+            && SUCCEEDED(device->CreateShaderResourceView(m_output.Get(), nullptr, &m_outputSrv))
+            && (!m_bidirectional || SUCCEEDED(device->CreateShaderResourceView(m_backward.Get(), nullptr, &m_backwardSrv)))
+            && SUCCEEDED(device->CreateShaderResourceView(m_contrast.Get(), nullptr, &m_contrastSrv))
+            && SUCCEEDED(device->CreateTexture2D(&cd, nullptr, &m_cells))
+            && SUCCEEDED(device->CreateUnorderedAccessView(m_cells.Get(), nullptr, &m_cellsUav))
+            && SUCCEEDED(device->CreateTexture2D(&sd, nullptr, &m_cellsStaging))
+            && SUCCEEDED(device->CreateBuffer(&pd, &pdData, &m_cellsParams));
+        Info("PyroWave motion vectors: cells made on the %s\n", m_gpuCells ? "GPU" : "CPU");
     }
     // Motion choice resources (setting "Send motion choice"): the vectors as uploaded, the field
     // the GPU makes from them, the choice per block and its readback.
@@ -689,7 +919,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             && SUCCEEDED(device->CreateSamplerState(&sampler, &m_linearSampler))
             && SUCCEEDED(device->CreateBuffer(&bd, nullptr, &m_selectParams))
             && SUCCEEDED(device->CreateQuery(&eventQuery, &m_choiceDone));
-        m_choiceBits.assign(size_t((m_blockWidth + 3) / 4) * m_blockHeight, 0);
+        m_choiceBits.assign(size_t(m_blockWidth), 0);
         if (!m_choiceReady) {
             Warn("PyroWave motion vectors: no motion choice (cannot build its shader or resources)\n");
         }
@@ -723,6 +953,14 @@ void PyroWaveMotion::Submit(ID3D11Texture2D* frame, uint64_t timestampNs) {
     }
     // A frame whose vectors were never collected is dropped: only the newest counts.
     m_pending = false;
+    const double submitStartMs = NowMs();
+    const bool timed = m_tsDisjoint != nullptr;
+    bool executed = false;
+    m_tsPending = false;
+    if (timed) {
+        m_context->Begin(m_tsDisjoint.Get());
+        m_context->End(m_ts[0].Get());
+    }
     m_context->CopyResource(m_rgba.Get(), frame);
     // Only compute state is touched, and unbound again, so SteamVR's and ALVR's rendering does not
     // see it.
@@ -745,6 +983,9 @@ void PyroWaveMotion::Submit(ID3D11Texture2D* frame, uint64_t timestampNs) {
     m_context->CSSetShaderResources(0, 1, &noSrv);
     m_context->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
     m_context->CSSetShader(nullptr, nullptr, 0);
+    if (timed) {
+        m_context->End(m_ts[1].Get());
+    }
     m_inputTimestamps[m_current] = timestampNs;
     const int reference = 1 - m_current;
     if (m_haveReference && m_inputTimestamps[reference] < timestampNs) {
@@ -756,21 +997,169 @@ void PyroWaveMotion::Submit(ID3D11Texture2D* frame, uint64_t timestampNs) {
         out.outputBuffer = m_outputHandle;
         out.bwdOutputBuffer = m_bidirectional ? m_backwardHandle : nullptr;
         if (m_api.nvOFExecute(m_handle, &in, &out) == NV_OF_SUCCESS) {
-            m_context->CopyResource(m_staging.Get(), m_output.Get());
-            if (m_bidirectional) {
-                m_context->CopyResource(m_backwardStaging.Get(), m_backward.Get());
+            if (timed) {
+                m_context->End(m_ts[2].Get());
             }
-            m_context->CopyResource(m_contrastStaging.Get(), m_contrast.Get());
+            if (m_gpuCells) {
+                // The cells on the GPU; only they are read back.
+                ID3D11ShaderResourceView* srvs[3] = { m_outputSrv.Get(), m_backwardSrv.Get(), m_contrastSrv.Get() };
+                ID3D11ShaderResourceView* noSrvs[3] = {};
+                ID3D11UnorderedAccessView* cellsUav = m_cellsUav.Get();
+                ID3D11Buffer* cb = m_cellsParams.Get();
+                ID3D11Buffer* noCb = nullptr;
+                m_context->CSSetShader(m_cellsCs.Get(), nullptr, 0);
+                m_context->CSSetConstantBuffers(0, 1, &cb);
+                m_context->CSSetShaderResources(0, 3, srvs);
+                m_context->CSSetUnorderedAccessViews(0, 1, &cellsUav, nullptr);
+                m_context->Dispatch((UINT)((m_gridWidth + 7) / 8), (UINT)((m_gridHeight + 7) / 8), 1);
+                m_context->CSSetShaderResources(0, 3, noSrvs);
+                m_context->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+                m_context->CSSetConstantBuffers(0, 1, &noCb);
+                m_context->CSSetShader(nullptr, nullptr, 0);
+                m_context->CopyResource(m_cellsStaging.Get(), m_cells.Get());
+            }
+            if (!m_gpuCells || m_validateFrames > 0) {
+                m_context->CopyResource(m_staging.Get(), m_output.Get());
+                if (m_bidirectional) {
+                    m_context->CopyResource(m_backwardStaging.Get(), m_backward.Get());
+                }
+                m_context->CopyResource(m_contrastStaging.Get(), m_contrast.Get());
+            }
+            if (timed) {
+                m_context->End(m_ts[3].Get());
+                m_context->End(m_tsDisjoint.Get());
+                m_tsPending = true;
+                executed = true;
+            }
             m_context->End(m_done.Get());
             m_pending = true;
             m_pendingTimestamp = timestampNs;
             m_pendingInput = m_current;
             m_pendingReference = m_inputTimestamps[reference];
             m_pendingSubmitMs = NowMs();
+            m_pendingSubmitCpuMs = m_pendingSubmitMs - submitStartMs;
         }
+    }
+    if (timed && !executed) {
+        m_context->End(m_tsDisjoint.Get());
     }
     m_haveReference = true;
     m_current = reference;
+}
+
+// The cells kCellVectors made, from their readback (the same values CellsOnCpu makes).
+bool PyroWaveMotion::CellsOnGpu() {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_context->Map(m_cellsStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
+    for (int gy = 0; gy < m_gridHeight; gy++) {
+        const int32_t* row = reinterpret_cast<const int32_t*>(static_cast<const uint8_t*>(mapped.pData) + size_t(gy) * mapped.RowPitch);
+        for (int gx = 0; gx < m_gridWidth; gx++) {
+            const int32_t* c = row + 4 * gx;
+            const size_t i = 2 * (size_t(gy) * m_gridWidth + gx);
+            m_grid[i] = int16_t(c[0]);
+            m_grid[i + 1] = int16_t(c[1]);
+            m_statConsistentVectors += c[2] & 0xffff;
+            m_statVectors += uint32_t(c[2]) >> 16;
+            m_statInconsistentCells += c[3] == 1;
+            m_statFlatCells += c[3] == 2;
+        }
+    }
+    m_context->Unmap(m_cellsStaging.Get(), 0);
+    m_statCells += uint64_t(m_gridWidth) * m_gridHeight;
+    return true;
+}
+
+// The cells from the flow readback, on the CPU (without the GPU cells, and to check them).
+bool PyroWaveMotion::CellsOnCpu(std::vector<int16_t>& grid, bool stats) {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_context->Map(m_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
+    D3D11_MAPPED_SUBRESOURCE backward = {};
+    const bool check = m_bidirectional
+        && SUCCEEDED(m_context->Map(m_backwardStaging.Get(), 0, D3D11_MAP_READ, 0, &backward));
+    auto vectorAt = [](const D3D11_MAPPED_SUBRESOURCE& m, int x, int y) {
+        return reinterpret_cast<const int16_t*>(static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch)
+            + 2 * x;
+    };
+    // Average the consistent 4x4 pixel vectors of each cell (S10.5 stays S10.5). A vector is
+    // consistent when the backward flow where it points comes back to within a pixel (or 15 % of
+    // its length) of its start.
+    const int k = m_cellPixels / (kFlowGrid * m_scale);
+    for (int gy = 0; gy < m_gridHeight; gy++) {
+        for (int gx = 0; gx < m_gridWidth; gx++) {
+            int32_t sx = 0, sy = 0, n = 0;
+            for (int y = gy * k; y < std::min((gy + 1) * k, m_flowHeight); y++) {
+                for (int x = gx * k; x < (gx + 1) * k; x++) {
+                    const int16_t* f = vectorAt(mapped, x, y);
+                    if (check) {
+                        const float fx = f[0] / 32.0f, fy = f[1] / 32.0f;
+                        const int bx = std::clamp(x + (int)std::lround(fx / kFlowGrid), 0, m_flowWidth - 1);
+                        const int by = std::clamp(y + (int)std::lround(fy / kFlowGrid), 0, m_flowHeight - 1);
+                        const int16_t* b = vectorAt(backward, bx, by);
+                        const float ex = fx + b[0] / 32.0f, ey = fy + b[1] / 32.0f;
+                        if (stats) m_statVectors++;
+                        if (std::sqrt(ex * ex + ey * ey) > std::max(1.0f, 0.15f * std::sqrt(fx * fx + fy * fy))) {
+                            continue;
+                        }
+                    }
+                    sx += f[0];
+                    sy += f[1];
+                    n++;
+                }
+            }
+            const size_t i = 2 * (size_t(gy) * m_gridWidth + gx);
+            if (n == 0) {
+                grid[i] = PyroWaveStripes::MotionUnreliable;
+                grid[i + 1] = 0;
+                if (stats) m_statInconsistentCells++;
+                continue;
+            }
+            // Back to full resolution pixels, still S10.5 (x never reaches MotionUnreliable).
+            grid[i] = int16_t(std::clamp(sx * m_scale / n, -32767, 32767));
+            grid[i + 1] = int16_t(std::clamp(sy * m_scale / n, -32767, 32767));
+            if (stats) m_statConsistentVectors += n;
+        }
+    }
+    m_context->Unmap(m_staging.Get(), 0);
+    if (check) {
+        m_context->Unmap(m_backwardStaging.Get(), 0);
+    }
+
+    // Flat cells: optical flow finds no unique match there, and its vectors would drag the
+    // picture around them (seen on SteamVR menu backgrounds, 2026-10-07).
+    if (SUCCEEDED(m_context->Map(m_contrastStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        for (int gy = 0; gy < m_gridHeight; gy++) {
+            const float* row = reinterpret_cast<const float*>(
+                static_cast<const uint8_t*>(mapped.pData) + size_t(gy) * mapped.RowPitch
+            );
+            for (int gx = 0; gx < m_gridWidth; gx++) {
+                int16_t* cell = &grid[2 * (size_t(gy) * m_gridWidth + gx)];
+                if (row[gx] < kFlatContrast && cell[0] != PyroWaveStripes::MotionUnreliable) {
+                    cell[0] = PyroWaveStripes::MotionUnreliable;
+                    cell[1] = 0;
+                    if (stats) m_statFlatCells++;
+                }
+            }
+        }
+        m_context->Unmap(m_contrastStaging.Get(), 0);
+    }
+    if (stats) m_statCells += uint64_t(m_gridWidth) * m_gridHeight;
+
+    // Steps of 1/8 pixel (MotionStep): the in-between moves half a vector, so this is under 1/32
+    // pixel there, and the coarser steps compress far better. The choice below works on the same
+    // rounded vectors the headset gets.
+    for (size_t i = 0; i < grid.size(); i += 2) {
+        if (grid[i] != PyroWaveStripes::MotionUnreliable) {
+            for (int c = 0; c < 2; c++) {
+                const long steps = std::lround(grid[i + c] / double(PyroWaveStripes::MotionStep));
+                grid[i + c] = int16_t(std::clamp<long>(steps * PyroWaveStripes::MotionStep, -32764, 32764));
+            }
+        }
+    }
+    return true;
 }
 
 bool PyroWaveMotion::Collect(
@@ -801,113 +1190,73 @@ bool PyroWaveMotion::Collect(
     const double readyMs = NowMs() - m_pendingSubmitMs;
     m_statReadyMs += readyMs;
     m_statReadyMaxMs = std::max(m_statReadyMaxMs, readyMs);
+    if (m_tsPending) {
+        // Done with the event above, so these are in as well; a disjoint interval is skipped.
+        m_tsPending = false;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+        UINT64 t[4] = {};
+        bool ok = m_context->GetData(m_tsDisjoint.Get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && !disjoint.Disjoint && disjoint.Frequency > 0;
+        for (int i = 0; ok && i < 4; i++) {
+            ok = m_context->GetData(m_ts[i].Get(), &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        }
+        if (ok && t[3] >= t[0]) {
+            const double toMs = 1000.0 / double(disjoint.Frequency);
+            for (int i = 0; i < 3; i++) {
+                m_statStageMs[i] += double(t[i + 1] - t[i]) * toMs;
+            }
+            const double span = double(t[3] - t[0]) * toMs;
+            m_statGpuSpanMs += span;
+            m_statGpuSpanMaxMs = std::max(m_statGpuSpanMaxMs, span);
+            m_statWaitMs += std::max(0.0, readyMs + m_pendingSubmitCpuMs - span);
+            m_statSubmitCpuMs += m_pendingSubmitCpuMs;
+            m_statTimed++;
+        }
+    }
 
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_context->Map(m_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (m_gpuCells) {
+        if (!CellsOnGpu()) {
+            return false;
+        }
+        if (m_validateFrames > 0) {
+            // The first frames are made on the CPU as well and compared cell by cell.
+            m_validateFrames--;
+            m_validateGrid.resize(m_grid.size());
+            if (CellsOnCpu(m_validateGrid, false)) {
+                size_t differ = 0;
+                for (size_t i = 0; i < m_grid.size(); i += 2) {
+                    differ += m_grid[i] != m_validateGrid[i] || m_grid[i + 1] != m_validateGrid[i + 1];
+                }
+                m_validateCells += m_grid.size() / 2;
+                m_validateDiffer += differ;
+            }
+            if (m_validateFrames == 0) {
+                Info(
+                    "PyroWave motion vectors: GPU cells checked against the CPU: %zu of %zu cells differ\n",
+                    m_validateDiffer,
+                    m_validateCells
+                );
+            }
+        }
+    } else if (!CellsOnCpu(m_grid, true)) {
         return false;
     }
-    D3D11_MAPPED_SUBRESOURCE backward = {};
-    const bool check = m_bidirectional
-        && SUCCEEDED(m_context->Map(m_backwardStaging.Get(), 0, D3D11_MAP_READ, 0, &backward));
-    auto vectorAt = [](const D3D11_MAPPED_SUBRESOURCE& m, int x, int y) {
-        return reinterpret_cast<const int16_t*>(static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch)
-            + 2 * x;
-    };
-    // Average the consistent 4x4 pixel vectors of each cell (S10.5 stays S10.5). A vector is
-    // consistent when the backward flow where it points comes back to within a pixel (or 15 % of
-    // its length) of its start.
-    const int k = m_cellPixels / (kFlowGrid * m_scale);
+    m_rowBuffers.resize(m_gridHeight);
     for (int gy = 0; gy < m_gridHeight; gy++) {
-        for (int gx = 0; gx < m_gridWidth; gx++) {
-            int32_t sx = 0, sy = 0, n = 0;
-            for (int y = gy * k; y < std::min((gy + 1) * k, m_flowHeight); y++) {
-                for (int x = gx * k; x < (gx + 1) * k; x++) {
-                    const int16_t* f = vectorAt(mapped, x, y);
-                    if (check) {
-                        const float fx = f[0] / 32.0f, fy = f[1] / 32.0f;
-                        const int bx = std::clamp(x + (int)std::lround(fx / kFlowGrid), 0, m_flowWidth - 1);
-                        const int by = std::clamp(y + (int)std::lround(fy / kFlowGrid), 0, m_flowHeight - 1);
-                        const int16_t* b = vectorAt(backward, bx, by);
-                        const float ex = fx + b[0] / 32.0f, ey = fy + b[1] / 32.0f;
-                        m_statVectors++;
-                        if (std::sqrt(ex * ex + ey * ey) > std::max(1.0f, 0.15f * std::sqrt(fx * fx + fy * fy))) {
-                            continue;
-                        }
-                    }
-                    sx += f[0];
-                    sy += f[1];
-                    n++;
-                }
-            }
-            const size_t i = 2 * (size_t(gy) * m_gridWidth + gx);
-            if (n == 0) {
-                m_grid[i] = PyroWaveStripes::MotionUnreliable;
-                m_grid[i + 1] = 0;
-                m_statInconsistentCells++;
-                continue;
-            }
-            // Back to full resolution pixels, still S10.5 (x never reaches MotionUnreliable).
-            m_grid[i] = int16_t(std::clamp(sx * m_scale / n, -32767, 32767));
-            m_grid[i + 1] = int16_t(std::clamp(sy * m_scale / n, -32767, 32767));
-            m_statConsistentVectors += n;
-        }
+        m_rowBuffers[gy].clear();
+        EncodeMotionRow(m_grid.data() + size_t(gy) * m_gridWidth * 2, m_gridWidth, m_rowBuffers[gy]);
     }
-    m_context->Unmap(m_staging.Get(), 0);
-    if (check) {
-        m_context->Unmap(m_backwardStaging.Get(), 0);
-    }
-
-    // Flat cells: optical flow finds no unique match there, and its vectors would drag the
-    // picture around them (seen on SteamVR menu backgrounds, 2026-10-07).
-    if (SUCCEEDED(m_context->Map(m_contrastStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        for (int gy = 0; gy < m_gridHeight; gy++) {
-            const float* row = reinterpret_cast<const float*>(
-                static_cast<const uint8_t*>(mapped.pData) + size_t(gy) * mapped.RowPitch
-            );
-            for (int gx = 0; gx < m_gridWidth; gx++) {
-                int16_t* cell = &m_grid[2 * (size_t(gy) * m_gridWidth + gx)];
-                if (row[gx] < kFlatContrast && cell[0] != PyroWaveStripes::MotionUnreliable) {
-                    cell[0] = PyroWaveStripes::MotionUnreliable;
-                    cell[1] = 0;
-                    m_statFlatCells++;
-                }
-            }
-        }
-        m_context->Unmap(m_contrastStaging.Get(), 0);
-    }
-    m_statCells += uint64_t(m_gridWidth) * m_gridHeight;
-
-    // Whole rows per packet.
-    const size_t rowBytes = size_t(m_gridWidth) * 2 * sizeof(int16_t);
-    const size_t overhead = sizeof(PyroWaveStripes::PacketPrefix) + sizeof(PyroWaveStripes::MotionHeader);
-    const int rowsPerPacket = (int)std::max<size_t>(1, (maxPacketBytes - overhead) / rowBytes);
-    const uint32_t packetCount = (uint32_t)((m_gridHeight + rowsPerPacket - 1) / rowsPerPacket);
-    for (uint32_t p = 0; p < packetCount; p++) {
-        const int firstRow = (int)p * rowsPerPacket;
-        const int rows = std::min(rowsPerPacket, m_gridHeight - firstRow);
-        PyroWaveStripes::PacketPrefix prefix = {};
-        prefix.stripe = PyroWaveStripes::MotionStripe;
-        prefix.stripe_count = stripeCount;
-        prefix.packet_index = p;
-        prefix.packet_count = packetCount;
-        prefix.data_bytes = (uint32_t)(sizeof(PyroWaveStripes::MotionHeader) + rows * rowBytes);
-        PyroWaveStripes::MotionHeader header = {};
-        header.magic = PyroWaveStripes::MotionMagic;
-        header.version = PyroWaveStripes::MotionVersion;
-        header.reference_timestamp_ns = m_pendingReference;
-        header.grid_width = (uint16_t)m_gridWidth;
-        header.grid_height = (uint16_t)m_gridHeight;
-        header.cell_pixels = (uint16_t)m_cellPixels;
-        header.first_row = (uint16_t)firstRow;
-        header.row_count = (uint16_t)rows;
-        const size_t start = buffer.size();
-        buffer.resize(start + overhead + rows * rowBytes);
-        memcpy(buffer.data() + start, &prefix, sizeof(prefix));
-        memcpy(buffer.data() + start + sizeof(prefix), &header, sizeof(header));
-        memcpy(buffer.data() + start + overhead, m_grid.data() + size_t(firstRow) * m_gridWidth * 2, rows * rowBytes);
-        sizes.push_back((uint32_t)(overhead + rows * rowBytes));
-        m_statBytes += overhead + rows * rowBytes;
-    }
+    PyroWaveStripes::PacketPrefix prefix = {};
+    prefix.stripe = PyroWaveStripes::MotionStripe;
+    prefix.stripe_count = stripeCount;
+    PyroWaveStripes::MotionHeader header = {};
+    header.magic = PyroWaveStripes::MotionMagic;
+    header.version = PyroWaveStripes::MotionVersion;
+    header.reference_timestamp_ns = m_pendingReference;
+    header.grid_width = (uint16_t)m_gridWidth;
+    header.grid_height = (uint16_t)m_gridHeight;
+    header.cell_pixels = (uint16_t)m_cellPixels;
+    PackRows(m_rowBuffers, prefix, header, maxPacketBytes, buffer, sizes, m_statBytes);
     if (m_choiceReady) {
         DispatchChoice();
     }
@@ -1099,47 +1448,29 @@ bool PyroWaveMotion::CollectChoice(
     if (FAILED(m_context->Map(m_choiceStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         return false;
     }
-    const size_t rowBytes = size_t(m_blockWidth + 3) / 4;
-    std::fill(m_choiceBits.begin(), m_choiceBits.end(), uint8_t(0));
+    m_choiceBits.resize(size_t(m_blockWidth));
+    m_rowBuffers.resize(m_blockHeight);
     for (int by = 0; by < m_blockHeight; by++) {
         const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + size_t(by) * mapped.RowPitch;
-        uint8_t* out = m_choiceBits.data() + size_t(by) * rowBytes;
         for (int bx = 0; bx < m_blockWidth; bx++) {
-            const uint8_t c = std::min<uint8_t>(row[bx], 2);
-            out[bx / 4] |= uint8_t(c << (2 * (bx % 4)));
+            m_choiceBits[bx] = std::min<uint8_t>(row[bx], 2);
         }
+        m_rowBuffers[by].clear();
+        EncodeChoiceRow(m_choiceBits.data(), m_blockWidth, m_rowBuffers[by]);
     }
     m_context->Unmap(m_choiceStaging.Get(), 0);
 
-    const size_t overhead = sizeof(PyroWaveStripes::PacketPrefix) + sizeof(PyroWaveStripes::MotionHeader);
-    const int rowsPerPacket = (int)std::max<size_t>(1, (maxPacketBytes - overhead) / rowBytes);
-    const uint32_t packetCount = (uint32_t)((m_blockHeight + rowsPerPacket - 1) / rowsPerPacket);
-    for (uint32_t p = 0; p < packetCount; p++) {
-        const int firstRow = (int)p * rowsPerPacket;
-        const int rows = std::min(rowsPerPacket, m_blockHeight - firstRow);
-        PyroWaveStripes::PacketPrefix prefix = {};
-        prefix.stripe = PyroWaveStripes::MotionStripe;
-        prefix.stripe_count = stripeCount;
-        prefix.packet_index = p;
-        prefix.packet_count = packetCount;
-        prefix.data_bytes = (uint32_t)(sizeof(PyroWaveStripes::MotionHeader) + rows * rowBytes);
-        PyroWaveStripes::MotionHeader header = {};
-        header.magic = PyroWaveStripes::MotionChoiceMagic;
-        header.version = PyroWaveStripes::MotionChoiceVersion;
-        header.reference_timestamp_ns = m_choiceReference;
-        header.grid_width = (uint16_t)m_blockWidth;
-        header.grid_height = (uint16_t)m_blockHeight;
-        header.cell_pixels = (uint16_t)kChoiceBlock;
-        header.first_row = (uint16_t)firstRow;
-        header.row_count = (uint16_t)rows;
-        const size_t start = buffer.size();
-        buffer.resize(start + overhead + rows * rowBytes);
-        memcpy(buffer.data() + start, &prefix, sizeof(prefix));
-        memcpy(buffer.data() + start + sizeof(prefix), &header, sizeof(header));
-        memcpy(buffer.data() + start + overhead, m_choiceBits.data() + size_t(firstRow) * rowBytes, rows * rowBytes);
-        sizes.push_back((uint32_t)(overhead + rows * rowBytes));
-        m_statBytes += overhead + rows * rowBytes;
-    }
+    PyroWaveStripes::PacketPrefix prefix = {};
+    prefix.stripe = PyroWaveStripes::MotionStripe;
+    prefix.stripe_count = stripeCount;
+    PyroWaveStripes::MotionHeader header = {};
+    header.magic = PyroWaveStripes::MotionChoiceMagic;
+    header.version = PyroWaveStripes::MotionChoiceVersion;
+    header.reference_timestamp_ns = m_choiceReference;
+    header.grid_width = (uint16_t)m_blockWidth;
+    header.grid_height = (uint16_t)m_blockHeight;
+    header.cell_pixels = (uint16_t)kChoiceBlock;
+    PackRows(m_rowBuffers, prefix, header, maxPacketBytes, buffer, sizes, m_statBytes);
     return true;
 }
 
@@ -1166,6 +1497,31 @@ void PyroWaveMotion::ReportIfDue() {
         m_statCells ? 100.0 * double(m_statInconsistentCells) / double(m_statCells) : 0.0,
         m_statVectors ? 100.0 * double(m_statConsistentVectors) / double(m_statVectors) : 100.0
     );
+    if (m_statTimed > 0) {
+        // Where "ready after the copy" goes: the stages' own GPU time, and the rest of the time from
+        // recording the work to its result being read, which is waiting (for the GPU, behind
+        // what the D3D11 queue holds before it).
+        const double n = double(m_statTimed);
+        Info(
+            "PyroWave motion vectors, GPU: %llu frames timed, copy+luma+contrast %.2f ms, optical flow "
+            "%.2f ms, cells+readback %.2f ms, together %.2f ms avg %.2f max; recording %.2f ms on the CPU; "
+            "waiting %.2f ms avg until the result was read\n",
+            (unsigned long long)m_statTimed,
+            m_statStageMs[0] / n,
+            m_statStageMs[1] / n,
+            m_statStageMs[2] / n,
+            m_statGpuSpanMs / n,
+            m_statGpuSpanMaxMs,
+            m_statSubmitCpuMs / n,
+            m_statWaitMs / n
+        );
+    }
+    m_statTimed = 0;
+    m_statStageMs[0] = m_statStageMs[1] = m_statStageMs[2] = 0.0;
+    m_statGpuSpanMs = 0.0;
+    m_statGpuSpanMaxMs = 0.0;
+    m_statWaitMs = 0.0;
+    m_statSubmitCpuMs = 0.0;
     m_statStartMs = now;
     m_statFrames = 0;
     m_statLate = 0;
@@ -1237,6 +1593,15 @@ void PyroWaveMotion::Release() {
     m_contrastView.Reset();
     m_contrast.Reset();
     m_contrastStaging.Reset();
+    m_cellsStaging.Reset();
+    m_cellsUav.Reset();
+    m_cells.Reset();
+    m_contrastSrv.Reset();
+    m_backwardSrv.Reset();
+    m_outputSrv.Reset();
+    m_cellsParams.Reset();
+    m_cellsCs.Reset();
+    m_gpuCells = false;
     for (auto& v : m_inputSrvs) {
         v.Reset();
     }
@@ -1245,6 +1610,11 @@ void PyroWaveMotion::Release() {
     m_backwardStaging.Reset();
     m_staging.Reset();
     m_done.Reset();
+    m_tsDisjoint.Reset();
+    for (auto& q : m_ts) {
+        q.Reset();
+    }
+    m_tsPending = false;
     m_context.Reset();
     if (m_library) {
         FreeLibrary(m_library);

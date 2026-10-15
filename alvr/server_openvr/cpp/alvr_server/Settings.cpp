@@ -116,6 +116,10 @@ void Settings::Load() {
         m_nvencRcAverageBitrate = config.get("rc_average_bitrate").get<int64_t>();
         m_nvencEnableWeightedPrediction
             = config.get("nvenc_enable_weighted_prediction").get<bool>();
+        m_nvencFoveatedQpMap = config.get("nvenc_foveated_qp_map").get<bool>();
+        m_nvencCenterQpOffset = (int)config.get("nvenc_center_qp_offset").get<int64_t>();
+        m_nvencEdgeQpOffset = (int)config.get("nvenc_edge_qp_offset").get<int64_t>();
+        m_nvencSplitEyes = config.get("nvenc_split_eyes").get<bool>();
 
         m_minimumIdrIntervalMs = config.get("minimum_idr_interval_ms").get<int64_t>();
 

@@ -99,6 +99,23 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_contrast;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_contrastView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_contrastStaging;
+    // The cells made on the GPU (kCellVectors) and read back instead of the whole flow.
+    bool m_gpuCells = false;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_cellsCs;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_cellsParams;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_outputSrv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_backwardSrv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_contrastSrv;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cells;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_cellsUav;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cellsStaging;
+    // The first frames are made on the CPU as well and compared (logged once).
+    int m_validateFrames = 30;
+    std::vector<int16_t> m_validateGrid;
+    size_t m_validateCells = 0;
+    size_t m_validateDiffer = 0;
+    bool CellsOnCpu(std::vector<int16_t>& grid, bool stats);
+    bool CellsOnGpu();
 
     // The current and the previous frame, in turn.
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_inputs[2];
@@ -116,6 +133,18 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_backwardStaging;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_staging;
     Microsoft::WRL::ComPtr<ID3D11Query> m_done;
+    // GPU timestamps of Submit's stages (2026-10-15, where the 13-15 ms until the vectors are ready
+    // go): start, after the luma and contrast, after the optical flow, after the cells and readback.
+    Microsoft::WRL::ComPtr<ID3D11Query> m_tsDisjoint;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_ts[4];
+    bool m_tsPending = false;
+    double m_pendingSubmitCpuMs = 0.0;
+    uint64_t m_statTimed = 0;
+    double m_statStageMs[3] = {};
+    double m_statGpuSpanMs = 0.0;
+    double m_statGpuSpanMaxMs = 0.0;
+    double m_statWaitMs = 0.0;
+    double m_statSubmitCpuMs = 0.0;
 
     bool m_pending = false;
     uint64_t m_pendingTimestamp = 0;
@@ -183,7 +212,10 @@ private:
     int m_blockWidth = 0;
     int m_blockHeight = 0;
     float m_eyeSizeRatio[2] = { 1.0f, 1.0f };
+    // One row of the choice, a value per block.
     std::vector<uint8_t> m_choiceBits;
+    // The encoded rows of the vectors or the choice being packed (MotionVersion 2).
+    std::vector<std::vector<uint8_t>> m_rowBuffers;
 };
 
 #endif

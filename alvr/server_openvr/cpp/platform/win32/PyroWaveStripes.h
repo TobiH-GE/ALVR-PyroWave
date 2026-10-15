@@ -81,11 +81,21 @@ static_assert(sizeof(PacketPrefix) == 16, "PacketPrefix layout");
 // frame's own packets, as soon as the streamer has them. Each starts with a PacketPrefix whose
 // stripe is MotionStripe (stripe_count as in the frame; packet_index and packet_count count the
 // motion packets only; data_bytes the bytes after the prefix), then a MotionHeader, then the grid
-// rows [first_row, first_row + row_count): per cell int16 x, y in 1/32 picture pixels (NVIDIA
-// Optical Flow's S10.5), pointing from this frame to the reference frame, i.e. to where the cell's
-// content was in that frame; x = MotionUnreliable marks a cell without reliable motion (flat, no
-// texture to match), where the client should assume none beyond head rotation. A client that
-// does not know the packets drops them as malformed.
+// rows [first_row, first_row + row_count). Each cell holds a vector x, y in 1/32 picture pixels
+// (NVIDIA Optical Flow's S10.5), pointing from this frame to the reference frame, i.e. to where the
+// cell's content was in that frame, or "unreliable": no reliable motion (flat, no texture to
+// match), where the client should assume none beyond head rotation. A client that does not know
+// the packets drops them as malformed.
+//
+// Version 1 sent per cell int16 x, y, x = MotionUnreliable for unreliable cells (~336 KB per frame
+// at 7040x2496). Version 2 (2026-10-12) sends the vectors in steps of MotionStep (1/8 pixel) and
+// codes each row on its own, left to right, against the last reliable vector of the row (0, 0 at
+// its start), in steps, one token per byte:
+//   0x00-0x3f  n = token + 1 unreliable cells
+//   0x40-0x7f  n = token - 0x3f cells equal to the last reliable vector
+//   0x80-0xbf  one cell, the last reliable vector + (dx, dy), dx = bits 3-5 - 4, dy = bits 0-2 - 4
+//   0xc0       one cell, the last reliable vector + (dx, dy), each a zigzag LEB128 varint after it
+// A row ends after grid_width cells, the next starts right behind it.
 static const uint16_t MotionStripe = 0xffff;
 static const int16_t MotionUnreliable = -32768;
 struct MotionHeader {
@@ -100,17 +110,19 @@ struct MotionHeader {
     uint16_t reserved[3];
 };
 static const uint32_t MotionMagic = 0x564d5750; // "PWMV"
-static const uint32_t MotionVersion = 1;
+static const uint32_t MotionVersion = 2;
+static const int16_t MotionStep = 4; // version 2: 1/8 pixel in S10.5
 
 // The streamer's motion choice of a frame (sent after its motion vectors, same PacketPrefix and
 // MotionHeader layout, magic MotionChoiceMagic): for every block of cell_pixels x cell_pixels
 // picture pixels which of three motions the in-between should follow there, chosen on the
 // original frames: 0 the motion field (the vectors above, as the headset prepares them), 1 head
 // rotation only (content fixed in the world), 2 none (content fixed to the view, like a HUD).
-// The grid rows carry 2 bits per block, four blocks per byte, the first block in the low bits.
+// Version 1: the grid rows carry 2 bits per block, four blocks per byte, the first block in the
+// low bits. Version 2: each row as runs, one byte per run: choice << 6 | (length - 1), 1-64 blocks.
 // The same choice the headset's "Choose Motion per Pixel" makes on its own GPU.
 static const uint32_t MotionChoiceMagic = 0x434d5750; // "PWMC"
-static const uint32_t MotionChoiceVersion = 1;
+static const uint32_t MotionChoiceVersion = 2;
 static_assert(sizeof(MotionHeader) == 32, "MotionHeader layout");
 
 // PyroWave's BitstreamSequenceHeader (bitstream.md, "Start of frame header"), built with

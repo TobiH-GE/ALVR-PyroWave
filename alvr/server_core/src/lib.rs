@@ -38,7 +38,7 @@ use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     ffi::OsStr,
     fs::File,
@@ -113,6 +113,10 @@ pub struct ConnectionContext {
     clients_to_be_removed: Mutex<HashSet<String>>,
     // One entry per frame, or per piece of one, see send_video_frame_piece.
     video_channel_sender: Mutex<Option<SyncSender<Vec<VideoPacket>>>>,
+    // Motion packets for the headset's frame interpolation: the send thread takes them ahead of
+    // the frame pieces still queued, between two chunks, so they arrive while their frame is
+    // still on the way (the headset can then use them before the frame is in).
+    video_priority_queue: Mutex<VecDeque<Vec<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
 
@@ -225,6 +229,7 @@ impl ServerCoreContext {
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
             video_channel_sender: Mutex::new(None),
+            video_priority_queue: Mutex::new(VecDeque::new()),
             haptics_sender: Mutex::new(None),
         });
 
@@ -440,18 +445,24 @@ impl ServerCoreContext {
                     .connection
                     .avoid_video_glitching
             {
+                // Motion packets for the headset's frame interpolation (their prefix starts with 0xffff,
+                // see FrameMotion.h) are not video: the mirror and the recording skip them.
+                let is_video = |packet: &&Vec<u8>| !packet.starts_with(&[0xff, 0xff]);
+
                 if let Some(sender) = &*self.connection_context.video_mirror_sender.lock() {
-                    for packet in &packets {
+                    for packet in packets.iter().filter(is_video) {
                         sender.send(packet.clone()).ok();
                     }
                 }
 
                 if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
-                    for packet in &packets {
+                    for packet in packets.iter().filter(is_video) {
                         file.write_all(packet).ok();
                     }
                 }
 
+                let motion_only =
+                    !packets.is_empty() && packets.iter().all(|packet| !is_video(&packet));
                 let piece = packets
                     .into_iter()
                     .map(|payload| VideoPacket {
@@ -462,6 +473,17 @@ impl ServerCoreContext {
                         payload,
                     })
                     .collect::<Vec<_>>();
+
+                if motion_only {
+                    // Ahead of the queued frame pieces; the empty entry only wakes an idle send
+                    // thread (a full queue means it is busy and takes them between two chunks).
+                    self.connection_context
+                        .video_priority_queue
+                        .lock()
+                        .push_back(piece);
+                    sender.try_send(Vec::new()).ok();
+                    return;
+                }
 
                 let refused = matches!(sender.try_send(piece), Err(TrySendError::Full(_)));
                 if refused {

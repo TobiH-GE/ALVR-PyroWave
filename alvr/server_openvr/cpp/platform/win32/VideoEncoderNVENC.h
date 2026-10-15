@@ -1,5 +1,6 @@
 #pragma once
 
+#include "FrameMotion.h"
 #include "NvEncoderD3D11.h"
 #include "VideoEncoder.h"
 #include "shared/d3drender.h"
@@ -23,17 +24,28 @@ public:
         bool insertIDR
     );
 
+    void SetFrameReadyTime(std::chrono::steady_clock::time_point time) override { m_frameReadyTime = time; }
+
 private:
     void FillEncodeConfig(
         NV_ENC_INITIALIZE_PARAMS& initializeParams,
         int refreshRate,
         int renderWidth,
         int renderHeight,
-        uint64_t bitrate_bps
+        uint64_t bitrate_bps,
+        NvEncoder* encoder = nullptr
     );
+    // The QP map of the picture columns [x0, x0 + width) (the whole frame, or one eye's half).
+    void BuildQpDeltaMap(int x0, int width, std::vector<int8_t>& map);
+    void CreateEncoder(std::shared_ptr<NvEncoder>& encoder, int width, uint64_t bitrate_bps);
+    void SendPackets(std::vector<std::vector<uint8_t>>& packets, uint64_t targetTimestampNs, bool insertIDR, int eye);
 
     std::ofstream fpOut;
     std::shared_ptr<NvEncoder> m_NvNecoder;
+    // "Encode eyes separately": m_NvNecoder encodes the left half, this one the right half.
+    std::shared_ptr<NvEncoder> m_NvNecoderRight;
+    bool m_splitEyes = false;
+    int m_encodeWidth = 0;
 
     std::shared_ptr<CD3DRender> m_pD3DRender;
 
@@ -42,4 +54,14 @@ private:
     int m_renderWidth;
     int m_renderHeight;
     int m_bitrateInMBits;
+
+    // Foveated QP map: a QP offset per CTB (HEVC) or superblock (AV1), empty when off.
+    std::vector<int8_t> m_qpDeltaMap;
+    std::vector<int8_t> m_qpDeltaMapRight;
+
+#ifdef ALVR_PYROWAVE
+    // Motion vectors for the headset's frame interpolation (streamer setting "Send motion vectors").
+    FrameMotion m_frameMotion;
+#endif
+    std::chrono::steady_clock::time_point m_frameReadyTime = std::chrono::steady_clock::now();
 };

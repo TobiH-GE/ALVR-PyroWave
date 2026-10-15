@@ -97,6 +97,12 @@ pub struct OpenvrConfig {
     pub rc_max_bitrate: i64,
     pub rc_average_bitrate: i64,
     pub nvenc_enable_weighted_prediction: bool,
+    // Foveated QP map (NVENC, HEVC and AV1 only, with foveated encoding).
+    pub nvenc_foveated_qp_map: bool,
+    pub nvenc_center_qp_offset: i32,
+    pub nvenc_edge_qp_offset: i32,
+    // NVENC, H.264/HEVC: an encoder per eye, the halves sent one after the other.
+    pub nvenc_split_eyes: bool,
     pub capture_frame_dir: String,
     pub amd_bitrate_corruption_fix: bool,
     pub use_separate_hand_trackers: bool,

@@ -470,6 +470,12 @@ void NvEncoder::MapResources(uint32_t bfrIdx)
 
 void NvEncoder::EncodeFrame(std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_PIC_PARAMS *pPicParams)
 {
+    EncodeFrame(vPacket, pPicParams, nullptr);
+}
+
+void NvEncoder::EncodeFrame(std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_PIC_PARAMS *pPicParams,
+                            const std::function<void()> &afterSubmit)
+{
     vPacket.clear();
     if (!IsHWEncoderInitialized())
     {
@@ -485,12 +491,38 @@ void NvEncoder::EncodeFrame(std::vector<std::vector<uint8_t>> &vPacket, NV_ENC_P
     if (nvStatus == NV_ENC_SUCCESS || nvStatus == NV_ENC_ERR_NEED_MORE_INPUT)
     {
         m_iToSend++;
+        if (afterSubmit)
+        {
+            afterSubmit();
+        }
         GetEncodedPacket(m_vBitstreamOutputBuffer, vPacket, true);
     }
     else
     {
         NVENC_THROW_ERROR("nvEncEncodePicture API failed", nvStatus);
     }
+}
+
+void NvEncoder::SubmitFrame(NV_ENC_PIC_PARAMS *pPicParams)
+{
+    if (!IsHWEncoderInitialized())
+    {
+        NVENC_THROW_ERROR("Encoder device not found", NV_ENC_ERR_NO_ENCODE_DEVICE);
+    }
+    int bfrIdx = m_iToSend % m_nEncoderBuffer;
+    MapResources(bfrIdx);
+    NVENCSTATUS nvStatus = DoEncode(m_vMappedInputBuffers[bfrIdx], m_vBitstreamOutputBuffer[bfrIdx], pPicParams);
+    if (nvStatus != NV_ENC_SUCCESS && nvStatus != NV_ENC_ERR_NEED_MORE_INPUT)
+    {
+        NVENC_THROW_ERROR("nvEncEncodePicture API failed", nvStatus);
+    }
+    m_iToSend++;
+}
+
+void NvEncoder::CollectFrame(std::vector<std::vector<uint8_t>> &vPacket)
+{
+    vPacket.clear();
+    GetEncodedPacket(m_vBitstreamOutputBuffer, vPacket, true);
 }
 
 void NvEncoder::RunMotionEstimation(std::vector<uint8_t> &mvData)
