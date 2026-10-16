@@ -103,6 +103,7 @@ pub struct OpenvrConfig {
     pub nvenc_edge_qp_offset: i32,
     // NVENC, H.264/HEVC: an encoder per eye, the halves sent one after the other.
     pub nvenc_split_eyes: bool,
+    pub nvenc_mv_hevc: bool,
     pub capture_frame_dir: String,
     pub amd_bitrate_corruption_fix: bool,
     pub use_separate_hand_trackers: bool,
@@ -124,6 +125,9 @@ pub struct OpenvrConfig {
     pub pyrowave_motion_vectors_level: u32,
     pub pyrowave_motion_vectors_both_directions: bool,
     pub pyrowave_motion_vectors_quarter_resolution: bool,
+    pub pyrowave_motion_vectors_grid: u32,
+    pub pyrowave_motion_vectors_neighbourhood_check: bool,
+    pub pyrowave_motion_vectors_pattern_check: bool,
 
     // these settings are not used on the C++ side, but we need them to correctly trigger a SteamVR
     // restart

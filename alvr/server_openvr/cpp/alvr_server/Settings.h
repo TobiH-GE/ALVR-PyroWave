@@ -79,6 +79,9 @@ public:
     uint32_t m_pyroWaveMotionLevel = 5; // NV_OF_PERF_LEVEL_SLOW
     bool m_pyroWaveMotionBothDirections = true;
     bool m_pyroWaveMotionQuarterResolution = false;
+    uint32_t m_pyroWaveMotionGrid = 4; // optical flow output grid in input texels: 4, 2 or 1
+    bool m_pyroWaveMotionNeighbourhoodCheck = true; // cells far off their surroundings' median sent as unreliable
+    bool m_pyroWaveMotionPatternCheck = true; // cells searched again near their surroundings' motion (repetitive patterns)
 
     uint32_t m_nvencTuningPreset;
     uint32_t m_nvencMultiPass;
@@ -103,6 +106,7 @@ public:
     int m_nvencEdgeQpOffset = 0;
     // NVENC, H.264/HEVC: an encoder per eye (VideoEncoderNVENC).
     bool m_nvencSplitEyes = false;
+    bool m_nvencMvHevc = false;
 
     uint64_t m_minimumIdrIntervalMs;
 

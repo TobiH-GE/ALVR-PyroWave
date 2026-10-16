@@ -117,6 +117,9 @@ public:
     *  input buffer and then call EncodeFrame() function to encode it.
     */
     const NvEncInputFrame* GetNextInputFrame();
+    // The input buffer of the picture queued `ahead` pictures after the next one (ALVR, MV-HEVC:
+    // both views are copied in before either is queued).
+    const NvEncInputFrame* GetNextInputFrame(int ahead);
 
 
     /**
@@ -136,6 +139,9 @@ public:
     // then waits for its output, so several encoders can work at the same time.
     void SubmitFrame(NV_ENC_PIC_PARAMS *pPicParams);
     void CollectFrame(std::vector<std::vector<uint8_t>> &vPacket);
+    // Waits for the output of every picture queued so far, ignoring the output delay (ALVR,
+    // MV-HEVC: both views of the frame, view 0 first).
+    void CollectAllFrames(std::vector<std::vector<uint8_t>> &vPacket);
 
     /**
     *  @brief  This function to flush the encoder queue.
@@ -152,6 +158,13 @@ public:
     *  dimensions, support for lookahead or the ME-only mode etc.
     */
     int GetCapabilityValue(GUID guidCodec, NV_ENC_CAPS capsToQuery);
+
+    // NVENC's own description of the last error of this session (ALVR: logged when the encoder
+    // cannot be set up, instead of a generic message).
+    const char* GetLastErrorString()
+    {
+        return m_hEncoder && m_nvenc.nvEncGetLastErrorString ? m_nvenc.nvEncGetLastErrorString(m_hEncoder) : "";
+    }
 
     /**
     *  @brief  This function is used to get the current device on which encoder is running.

@@ -96,6 +96,9 @@ void Settings::Load() {
         m_pyroWaveMotionLevel = (uint32_t)config.get("pyrowave_motion_vectors_level").get<int64_t>();
         m_pyroWaveMotionBothDirections = config.get("pyrowave_motion_vectors_both_directions").get<bool>();
         m_pyroWaveMotionQuarterResolution = config.get("pyrowave_motion_vectors_quarter_resolution").get<bool>();
+        m_pyroWaveMotionGrid = (uint32_t)config.get("pyrowave_motion_vectors_grid").get<int64_t>();
+        m_pyroWaveMotionNeighbourhoodCheck = config.get("pyrowave_motion_vectors_neighbourhood_check").get<bool>();
+        m_pyroWaveMotionPatternCheck = config.get("pyrowave_motion_vectors_pattern_check").get<bool>();
 
         m_nvencTuningPreset = (uint32_t)config.get("nvenc_tuning_preset").get<int64_t>();
         m_nvencMultiPass = (uint32_t)config.get("nvenc_multi_pass").get<int64_t>();
@@ -120,6 +123,7 @@ void Settings::Load() {
         m_nvencCenterQpOffset = (int)config.get("nvenc_center_qp_offset").get<int64_t>();
         m_nvencEdgeQpOffset = (int)config.get("nvenc_edge_qp_offset").get<int64_t>();
         m_nvencSplitEyes = config.get("nvenc_split_eyes").get<bool>();
+        m_nvencMvHevc = config.get("nvenc_mv_hevc").get<bool>();
 
         m_minimumIdrIntervalMs = config.get("minimum_idr_interval_ms").get<int64_t>();
 

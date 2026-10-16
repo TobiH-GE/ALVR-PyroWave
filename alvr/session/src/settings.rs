@@ -51,6 +51,17 @@ pub enum OpticalFlowPerfLevel {
 
 #[repr(u32)]
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+pub enum OpticalFlowGrid {
+    #[schema(strings(display_name = "4 (one vector per 4x4 texels, recommended)"))]
+    Texels4 = 4,
+    #[schema(strings(display_name = "2 (one vector per 2x2 texels)"))]
+    Texels2 = 2,
+    #[schema(strings(display_name = "1 (one vector per texel)"))]
+    Texels1 = 1,
+}
+
+#[repr(u32)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
 pub enum EncoderQualityPreset {
     Quality = 0,
     Balanced = 1,
@@ -179,6 +190,14 @@ Encodes the left and the right eye's half with an encoder each, at the same time
     ))]
     #[schema(flag = "steamvr-restart")]
     pub split_eyes: bool,
+    #[schema(strings(
+        display_name = "MV-HEVC (both eyes in one stream, experimental)",
+        help = r#"Only for NVENC with HEVC, on GPUs whose driver offers it (Video Codec SDK 13: RTX 50, RTX 40), and the visionOS client of this fork.
+Encodes the right eye's half as a second view that is predicted from the left one (multiview HEVC, as Apple's spatial videos): measured 10-19 % less data at the same quality on short sequences, likely 5-15 % in a game.
+While on, "Encode eyes separately" has no effect (both views go through one encoder, one after the other, and arrive together), and NVENC uses its "High Quality" tuning instead of the one set here, without lookahead, 2-pass or split encoding (NVENC offers MV-HEVC only like that). The bitrate set above is the whole stream's, each view gets half of it (NVENC applies it per view). The foveated QP map is applied per view; the streamer logs whether NVENC accepts it. Off: everything as before."#
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub mv_hevc: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
@@ -331,7 +350,7 @@ pub struct PyroWaveConfig {
 
     #[schema(strings(
         display_name = "Motion vectors: optical flow level",
-        help = "NVIDIA Optical Flow's own speed/quality level. Slow: the most accurate vectors, about 8-10 ms per frame at 7040x2496. Medium and Fast take less time, so the vectors reach the headset earlier (it holds a frame back when they come after it), with less accurate vectors."
+        help = "NVIDIA Optical Flow's own speed/quality level. Slow: the most accurate vectors, about 8-10 ms per frame at 7040x2496. Medium and Fast take less time, so the vectors reach the headset earlier (it holds a frame back when they come after it), with less accurate vectors. Measured at 7040x2496 on an RTX 5090: Medium at half resolution 4.1-5.4 ms, Fast at quarter resolution 1.5-1.9 ms. Recommended with the headset's \"Predict with Streamer Vectors\": Fast with quarter resolution, so the vectors reach it before their frame; for Blend Both Frames alone, Medium at half resolution gives more accurate vectors."
     ))]
     #[schema(flag = "steamvr-restart")]
     pub motion_vectors_level: OpticalFlowPerfLevel,
@@ -345,10 +364,31 @@ pub struct PyroWaveConfig {
 
     #[schema(strings(
         display_name = "Motion vectors: quarter resolution",
-        help = "Runs the optical flow on the frame at a quarter of its resolution in each direction instead of half: about a quarter of the time, one vector per 16x16 pixel cell instead of averaging four."
+        help = "Runs the optical flow on the frame at a quarter of its resolution in each direction instead of half: about a third of the time (1.5-1.9 instead of 4.1-5.4 ms at 7040x2496), with coarser vectors. Recommended on when the headset predicts with the streamer's vectors."
     ))]
     #[schema(flag = "steamvr-restart")]
     pub motion_vectors_quarter_resolution: bool,
+
+    #[schema(strings(
+        display_name = "Motion vectors: optical flow grid",
+        help = "How finely NVIDIA Optical Flow returns vectors, in texels of its input (half or quarter resolution, see above); the headset still gets one vector per 16x16 pixels, made from the finer ones that pass the forward-backward check and agree with the majority of them (a cell on the edge between two motions without a clear majority is left to the headset to fill). Measured at 7040x2496, Fast, quarter resolution, RTX 5090: grid 4 1.65-1.97 ms, grid 2 1.84-2.32 ms (+0.3 ms, a vector every 8 picture pixels, more vectors pass the check), grid 1 4.1-5.6 ms (+3 ms, which costs most of the lead the vectors have over their frame). Recommended: 4; grid 2 looked worse in a first test (2026-10-16), when the finer vectors were still averaged."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_vectors_grid: OpticalFlowGrid,
+
+    #[schema(strings(
+        display_name = "Motion vectors: check against the surroundings",
+        help = "Sends a cell's vector as unreliable when it is more than 3 pixels off the median of the reliable cells around it (9x9 cells of the same eye, every second one), so the headset fills it from its neighbours instead. On repetitive patterns (grated floors, rows of slats, text) optical flow often matches one pattern period off, and the in-between then shows the pattern bent or shifted until the next real frame puts it back. Offline on a Subnautica grated floor (2026-10-16): +0.6 dB, most of the bent slats gone. Costs a fraction of a millisecond on the GPU. A small object that really moves on its own (smaller than about 64x64 pixels) may get the motion of its surroundings in the in-between. Recommended: on. Off: the vectors as before."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_vectors_neighbourhood_check: bool,
+
+    #[schema(strings(
+        display_name = "Motion vectors: check repetitive patterns",
+        help = "On grids, perforated plates and rows of slats optical flow often locks onto a match one or several pattern periods off, in whole groups of cells, and the in-between then shows the pattern torn or shifted until the next real frame puts it back (Subnautica's perforated floors, 2026-10-16). This takes the motion of each cell's surroundings (median of the reliable cells up to 8 away) and searches the frames again only close to it (+-6 pixels); where that matches about as well as the cell's own vector, which a repetitive pattern always does, the cell follows its surroundings, and cells without a reliable vector get the match when it is good. Four passes, so the right motion spreads from the pattern's edges inwards. An object that really moves on its own matches only its own vector and keeps it. Offline: a perforated floor from 34 % wrong cells to about 1 %, +1.9 dB on a grated floor. Costs well under a millisecond on the GPU. Recommended: on. Off: as before."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub motion_vectors_pattern_check: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
@@ -1932,6 +1972,7 @@ pub fn session_settings_default() -> SettingsDefault {
                         },
                     },
                     split_eyes: false,
+                    mv_hevc: false,
                 },
                 quality_preset: EncoderQualityPresetDefault {
                     variant: EncoderQualityPresetDefaultVariant::Speed,
@@ -1964,6 +2005,11 @@ pub fn session_settings_default() -> SettingsDefault {
                     },
                     motion_vectors_both_directions: true,
                     motion_vectors_quarter_resolution: false,
+                    motion_vectors_grid: OpticalFlowGridDefault {
+                        variant: OpticalFlowGridDefaultVariant::Texels4,
+                    },
+                    motion_vectors_neighbourhood_check: true,
+                    motion_vectors_pattern_check: true,
                 },
             },
             mediacodec_extra_options: {

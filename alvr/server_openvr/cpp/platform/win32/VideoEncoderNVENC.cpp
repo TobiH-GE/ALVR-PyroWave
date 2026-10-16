@@ -20,6 +20,38 @@ VideoEncoderNVENC::VideoEncoderNVENC(std::shared_ptr<CD3DRender> pD3DRender, int
 VideoEncoderNVENC::~VideoEncoderNVENC() { }
 
 void VideoEncoderNVENC::Initialize() {
+    // "MV-HEVC": one encoder, the eyes' halves as the two views of a multiview HEVC stream. HEVC
+    // only; it takes the place of "Encode eyes separately".
+    m_mvHevc = Settings::Instance().m_nvencMvHevc && m_codec == ALVR_CODEC_HEVC && m_renderWidth % 4 == 0;
+    if (Settings::Instance().m_nvencMvHevc && !m_mvHevc) {
+        Warn("MV-HEVC: only for HEVC, encoding as usual\n");
+    }
+    if (m_mvHevc) {
+        m_encodeWidth = m_renderWidth / 2;
+        BuildQpDeltaMap(0, m_encodeWidth, m_qpDeltaMap);
+        BuildQpDeltaMap(m_encodeWidth, m_encodeWidth, m_qpDeltaMapRight);
+        try {
+            // Two pictures (the views) per frame, so the encoder needs a second buffer. NVENC applies
+            // the bitrate to each view (measured 2026-10-16: 150 Mbit/s set, about 250 sent), so each
+            // gets half: the setting is the whole stream's, as without MV-HEVC.
+            CreateEncoder(m_NvNecoder, m_encodeWidth, m_bitrateInMBits * 1'000'000L / 2, 1);
+            if (Settings::Instance().m_nvencSplitEyes) {
+                Info("Encode eyes separately: no effect with MV-HEVC\n");
+            }
+            Info(
+                "MV-HEVC: one encoder, two views of %dx%d, tuning High Quality%s\n",
+                m_encodeWidth,
+                m_renderHeight,
+                m_qpDeltaMap.empty() ? "" : ", foveated QP map per view"
+            );
+            return;
+        } catch (std::exception& e) {
+            Warn("MV-HEVC: not available on this GPU or driver (%s), encoding as usual\n", e.what());
+            m_NvNecoder.reset();
+            m_mvHevc = false;
+        }
+    }
+
     // "Encode eyes separately": an encoder per eye, each on half the width and half the bitrate.
     // H.264 and HEVC only (the client builds a decoder per eye from the one configuration both
     // halves share; AV1 sets its decoder up differently there).
@@ -31,6 +63,7 @@ void VideoEncoderNVENC::Initialize() {
     m_encodeWidth = m_splitEyes ? m_renderWidth / 2 : m_renderWidth;
 
     BuildQpDeltaMap(0, m_encodeWidth, m_qpDeltaMap);
+    m_qpDeltaMapRight.clear();
     if (m_splitEyes) {
         BuildQpDeltaMap(m_encodeWidth, m_encodeWidth, m_qpDeltaMapRight);
     }
@@ -45,7 +78,9 @@ void VideoEncoderNVENC::Initialize() {
     Debug("CNvEncoder is successfully initialized.\n");
 }
 
-void VideoEncoderNVENC::CreateEncoder(std::shared_ptr<NvEncoder>& encoder, int width, uint64_t bitrate_bps) {
+void VideoEncoderNVENC::CreateEncoder(
+    std::shared_ptr<NvEncoder>& encoder, int width, uint64_t bitrate_bps, uint32_t extraOutputDelay
+) {
     NV_ENC_BUFFER_FORMAT format
         = Settings::Instance().m_enableHdr ? NV_ENC_BUFFER_FORMAT_NV12 : NV_ENC_BUFFER_FORMAT_ABGR;
 
@@ -57,11 +92,16 @@ void VideoEncoderNVENC::CreateEncoder(std::shared_ptr<NvEncoder>& encoder, int w
     Debug("Initializing CNvEncoder. Width=%d Height=%d Format=%d\n", width, m_renderHeight, format);
 
     try {
-        encoder = std::make_shared<NvEncoderD3D11>(m_pD3DRender->GetDevice(), width, m_renderHeight, format, 0);
+        encoder = std::make_shared<NvEncoderD3D11>(m_pD3DRender->GetDevice(), width, m_renderHeight, format, extraOutputDelay);
     } catch (NVENCException e) {
         throw MakeException(
             "NvEnc NvEncoderD3D11 failed. Code=%d %hs\n", e.getErrorCode(), e.what()
         );
+    }
+    if (m_mvHevc && !encoder->GetCapabilityValue(NV_ENC_CODEC_HEVC_GUID, NV_ENC_CAPS_SUPPORT_MVHEVC_ENCODE)) {
+        encoder->DestroyEncoder();
+        encoder.reset();
+        throw MakeException("NV_ENC_CAPS_SUPPORT_MVHEVC_ENCODE is 0");
     }
 
     NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
@@ -72,6 +112,7 @@ void VideoEncoderNVENC::CreateEncoder(std::shared_ptr<NvEncoder>& encoder, int w
     try {
         encoder->CreateEncoder(&initializeParams);
     } catch (NVENCException e) {
+        Error("NvEnc CreateEncoder: %hs, NVENC says: %hs\n", e.what(), encoder->GetLastErrorString());
         if (e.getErrorCode() == NV_ENC_ERR_INVALID_PARAM) {
             throw MakeException(
                 "This GPU does not support H.265 encoding. (NvEncoderCuda NV_ENC_ERR_INVALID_PARAM)"
@@ -110,8 +151,26 @@ void VideoEncoderNVENC::Transmit(
     auto params = GetDynamicEncoderParams();
     if (params.updated) {
         m_bitrateInMBits = params.bitrate_bps / 1'000'000;
+        if (m_mvHevc) {
+            // NVENC reconfigures no MV-HEVC encoder (code 12, with resetEncoder too; 2026-10-16):
+            // a new one with the new bitrate, starting with an IDR. With a constant bitrate only
+            // on the first frame.
+            if (m_NvNecoder) {
+                m_NvNecoder->DestroyEncoder();
+                m_NvNecoder.reset();
+            }
+            try {
+                // Half per view (Initialize).
+                CreateEncoder(m_NvNecoder, m_encodeWidth, m_bitrateInMBits * 1'000'000L / 2, 1);
+                Info("MV-HEVC: encoder created anew for %d Mbit/s (half per view)\n", (int)m_bitrateInMBits);
+            } catch (std::exception& e) {
+                Error("MV-HEVC: no encoder for %d Mbit/s: %hs\n", (int)m_bitrateInMBits, e.what());
+                m_NvNecoder.reset();
+            }
+            insertIDR = true;
+        }
         for (auto* encoder : { &m_NvNecoder, &m_NvNecoderRight }) {
-            if (!*encoder) {
+            if (m_mvHevc || !*encoder) {
                 continue;
             }
             NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
@@ -152,7 +211,23 @@ void VideoEncoderNVENC::Transmit(
     const bool motion = false;
 #endif
 
-    if (m_splitEyes) {
+    if (m_mvHevc) {
+        // Nothing above this catches: an NVENC error would end vrserver. The frame is dropped
+        // instead (CEncoder releases the input after Transmit).
+        try {
+            TransmitMultiview(pTexture, targetTimestampNs, insertIDR, motion);
+        } catch (std::exception& e) {
+            static int reported = 0;
+            if (reported < 5) {
+                reported++;
+                Error(
+                    "MV-HEVC: frame dropped: %hs, NVENC says: %hs\n",
+                    e.what(),
+                    m_NvNecoder ? m_NvNecoder->GetLastErrorString() : ""
+                );
+            }
+        }
+    } else if (m_splitEyes) {
         // Both halves are queued before either is waited for, so the two encoders run at the same
         // time; the left half goes out as soon as it is done.
         auto* context = m_pD3DRender->GetContext();
@@ -217,6 +292,97 @@ void VideoEncoderNVENC::Transmit(
         m_frameMotion.SendAfterFrame(targetTimestampNs, m_frameReadyTime);
     }
 #endif
+}
+
+void VideoEncoderNVENC::TransmitMultiview(
+    ID3D11Texture2D* pTexture, uint64_t targetTimestampNs, bool insertIDR, bool motion
+) {
+    if (!m_NvNecoder) {
+        return;
+    }
+    // Both halves are copied into the encoder's two input buffers, then queued as views 0 and 1 of
+    // the frame, which come back as one access unit.
+    auto* context = m_pD3DRender->GetContext();
+    for (int view = 0; view < 2; view++) {
+        const NvEncInputFrame* input = m_NvNecoder->GetNextInputFrame(view);
+        D3D11_BOX box = { UINT(view * m_encodeWidth), 0, 0, UINT((view + 1) * m_encodeWidth), UINT(m_renderHeight), 1 };
+        context->CopySubresourceRegion(
+            reinterpret_cast<ID3D11Texture2D*>(input->inputPtr), 0, 0, 0, 0, pTexture, 0, &box
+        );
+    }
+    SubmitView(0, m_qpDeltaMap, insertIDR);
+    SubmitView(1, m_qpDeltaMapRight, insertIDR);
+#ifdef ALVR_PYROWAVE
+    if (motion) {
+        m_frameMotion.Submit(m_pD3DRender->GetDevice(), context, pTexture, targetTimestampNs);
+    }
+#endif
+    ReleaseInput();
+    std::vector<std::vector<uint8_t>> vPacket;
+    m_NvNecoder->CollectAllFrames(vPacket);
+#ifdef ALVR_PYROWAVE
+    // Polled once the views are encoded, as with one encoder: polled before, the vectors were
+    // never ready yet and always went out behind the frame (2026-10-16), too late for the
+    // headset's predicted in-betweens.
+    if (motion) {
+        m_frameMotion.SendBeforeFrame(targetTimestampNs, m_frameReadyTime);
+    }
+#endif
+    const unsigned char* views[2] = {};
+    int lengths[2] = {};
+    const int count = (int)std::min<size_t>(vPacket.size(), 2);
+    for (int v = 0; v < count; v++) {
+        views[v] = vPacket[v].data();
+        lengths[v] = (int)vPacket[v].size();
+    }
+    if (count != 2) {
+        Warn("MV-HEVC: %d views came back instead of 2\n", (int)vPacket.size());
+    }
+    static int reported = 0;
+    if (reported < 3) {
+        reported++;
+        Info(
+            "MV-HEVC: frame %d encoded, view 0 %d bytes, view 1 %d bytes%s\n",
+            reported,
+            lengths[0],
+            lengths[1],
+            insertIDR ? " (IDR)" : ""
+        );
+    }
+    ParseFrameNalsMultiview(views, lengths, count, targetTimestampNs, insertIDR);
+}
+
+void VideoEncoderNVENC::SubmitView(int view, std::vector<int8_t>& map, bool insertIDR) {
+    NV_ENC_PIC_PARAMS picParams = {};
+    if (insertIDR) {
+        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+    }
+    picParams.codecPicParams.hevcPicParams.viewId = (uint32_t)view;
+    if (!map.empty()) {
+        picParams.qpDeltaMap = map.data();
+        picParams.qpDeltaMapSize = (uint32_t)map.size();
+    }
+    try {
+        m_NvNecoder->SubmitFrame(&picParams);
+    } catch (NVENCException& e) {
+        if (map.empty()) {
+            throw;
+        }
+        // Whether NVENC takes a QP map with MV-HEVC is not documented: without it rather than
+        // no stream.
+        Warn("MV-HEVC: NVENC refuses the foveated QP map with the views (code %d), encoding without it\n", e.getErrorCode());
+        m_qpDeltaMap.clear();
+        m_qpDeltaMapRight.clear();
+        m_mvQpMapReported = true;
+        picParams.qpDeltaMap = nullptr;
+        picParams.qpDeltaMapSize = 0;
+        m_NvNecoder->SubmitFrame(&picParams);
+        return;
+    }
+    if (!map.empty() && !m_mvQpMapReported && view == 1) {
+        m_mvQpMapReported = true;
+        Info("MV-HEVC: NVENC took the foveated QP map with both views\n");
+    }
 }
 
 // eye -1: the whole frame; 0 or 1: that eye's half, the left one first.
@@ -313,6 +479,10 @@ void VideoEncoderNVENC::FillEncodeConfig(
 
     NV_ENC_TUNING_INFO tuningPreset
         = static_cast<NV_ENC_TUNING_INFO>(Settings::Instance().m_nvencTuningPreset);
+    if (m_mvHevc) {
+        // NVENC encodes MV-HEVC with this tuning only (Programming Guide, MV-HEVC).
+        tuningPreset = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+    }
 
     (encoder ? encoder : m_NvNecoder.get())->CreateDefaultEncoderParams(
         &initializeParams, encoderGUID, qualityPreset, tuningPreset
@@ -404,7 +574,12 @@ void VideoEncoderNVENC::FillEncodeConfig(
         config.idrPeriod = gopLength;
 
         if (Settings::Instance().m_use10bitEncoder) {
-            encodeConfig.encodeCodecConfig.hevcConfig.pixelBitDepthMinus8 = 2;
+            // 10-bit input (ABGR10 or P010) encoded as 10-bit (pixelBitDepthMinus8 = 2 before SDK 13).
+            encodeConfig.encodeCodecConfig.hevcConfig.inputBitDepth = NV_ENC_BIT_DEPTH_10;
+            encodeConfig.encodeCodecConfig.hevcConfig.outputBitDepth = NV_ENC_BIT_DEPTH_10;
+        }
+        if (m_mvHevc) {
+            config.enableMVHEVC = 1;
         }
 
         if (Settings::Instance().m_fillerData) {
@@ -444,7 +619,8 @@ void VideoEncoderNVENC::FillEncodeConfig(
         config.idrPeriod = gopLength;
 
         if (Settings::Instance().m_use10bitEncoder) {
-            config.pixelBitDepthMinus8 = 2;
+            config.inputBitDepth = NV_ENC_BIT_DEPTH_10;
+            config.outputBitDepth = NV_ENC_BIT_DEPTH_10;
         }
 
         if (Settings::Instance().m_fillerData) {
@@ -521,6 +697,16 @@ void VideoEncoderNVENC::FillEncodeConfig(
     }
     if (Settings::Instance().m_nvencRcAverageBitrate != -1) {
         encodeConfig.rcParams.averageBitRate = Settings::Instance().m_nvencRcAverageBitrate;
+    }
+    if (m_mvHevc) {
+        // Not available with MV-HEVC (Programming Guide): lookahead, 2-pass, split encoding.
+        encodeConfig.rcParams.enableLookahead = 0;
+        encodeConfig.rcParams.lookaheadDepth = 0;
+        encodeConfig.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+        initializeParams.splitEncodeMode = NV_ENC_SPLIT_DISABLE_MODE;
+        // Synchronous, as ffmpeg encodes MV-HEVC: in async mode the first frame's views never
+        // signalled completion and the encoder thread hung (2026-10-16).
+        initializeParams.enableEncodeAsync = 0;
     }
 }
 

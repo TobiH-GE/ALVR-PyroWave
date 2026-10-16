@@ -25,9 +25,23 @@ double NowMs() {
 }
 
 // NVIDIA Optical Flow's own vector grid; the vectors sent are averages over cellPixels.
-const int kFlowGrid = 4;
+// The optical flow output grid is m_flowGrid (input texels per vector, normally 4).
 // Cells whose luma varies less than this (standard deviation, 0..1) have no texture to match.
 const float kFlatContrast = 2.5f / 255.0f;
+// Check against the surroundings: cells up to 4 away each way, every second one (25 of 81, as
+// good as all of them offline), at least 5 reliable ones, a cell more than 3 pixels (S10.5) off
+// their median on either axis is unreliable.
+const int kNeighbourhoodRadius = 4;
+const int kNeighbourhoodStride = 2;
+const int kNeighbourhoodMin = 5;
+const int kNeighbourhoodLimit = 3 * 32;
+// Check repetitive patterns (kPatternCheck): the surroundings' median from the reliable cells up to
+// 8 away (every second one), searched again +-6 pixels around it; the cell follows it when that
+// matches within 2x (+1/255) of its own vector, an unreliable cell takes it when it matches within
+// 8/255 per texel. Four passes. Tuned offline on Subnautica (2026-10-16, floortest).
+const int kPatternRadius = 8;
+const int kPatternStride = 4;
+const int kPatternPasses = 4;
 
 // Motion choice: what it needs from outside (SetPoseHistory, SetViewTangents).
 std::mutex g_choiceMutex;
@@ -257,8 +271,15 @@ bool PyroWaveMotion::Initialize(
     // at full resolution it took ~17 ms per frame at 7040x2496 on an RTX 5090 (2026-10-07), longer
     // than the frame takes to send, and the vectors sent are 16 pixel averages anyway.
     m_scale = Settings::Instance().m_pyroWaveMotionQuarterResolution ? 4 : 2;
+    if (m_flowGrid == 0) {
+        const uint32_t grid = Settings::Instance().m_pyroWaveMotionGrid;
+        m_flowGrid = grid == 1 || grid == 2 ? int(grid) : 4;
+    }
+    m_haveReference = false;
+    m_current = 0;
+    m_pending = false;
     // The contrast shader works on cells of 8 texels of the half resolution input.
-    if (cellPixels % (kFlowGrid * m_scale) != 0 || cellPixels / m_scale > 8 || width % cellPixels != 0 || (width / 2) % cellPixels != 0) {
+    if (cellPixels % (m_flowGrid * m_scale) != 0 || cellPixels / m_scale > 8 || width % cellPixels != 0 || (width / 2) % cellPixels != 0) {
         Error(
             "PyroWave motion vectors: %dx%d does not split into %d pixel cells per eye, not sending "
             "them\n",
@@ -376,35 +397,113 @@ void main(uint3 id : SV_DispatchThreadID) {
     cells.GetDimensions(gw, gh);
     forward.GetDimensions(fw, fh);
     if (id.x >= gw || id.y >= gh) return;
-    int sx = 0, sy = 0, n = 0, checked = 0;
+    int2 v[FLOWK * FLOWK];
+    int n = 0, checked = 0;
     const int y1 = min(int(id.y + 1) * FLOWK, int(fh));
     for (int y = int(id.y) * FLOWK; y < y1; y++) {
         for (int x = int(id.x) * FLOWK; x < int(id.x + 1) * FLOWK; x++) {
             const int2 f = forward.Load(int3(x, y, 0));
             if (check != 0) {
                 const float fx = f.x / 32.0, fy = f.y / 32.0;
-                const int bx = clamp(x + RoundAway(fx / 4.0), 0, int(fw) - 1);
-                const int by = clamp(y + RoundAway(fy / 4.0), 0, int(fh) - 1);
+                const int bx = clamp(x + RoundAway(fx / FLOWGRID), 0, int(fw) - 1);
+                const int by = clamp(y + RoundAway(fy / FLOWGRID), 0, int(fh) - 1);
                 const int2 b = backward.Load(int3(bx, by, 0));
                 const float ex = fx + b.x / 32.0, ey = fy + b.y / 32.0;
                 checked++;
                 if (sqrt(ex * ex + ey * ey) > max(1.0, 0.15 * sqrt(fx * fx + fy * fy))) continue;
             }
-            sx += f.x;
-            sy += f.y;
+            v[n] = f;
             n++;
         }
     }
+    // The largest group of vectors that agree within AGREE: a cell on the edge between two motions
+    // has two groups, and their mean fits neither (seen as doubled edges with grid 2, 2026-10-16).
+    int best = 0, bestCount = 0;
+    for (int i = 0; i < n; i++) {
+        int c = 0;
+        for (int j = 0; j < n; j++) {
+            c += abs(v[i].x - v[j].x) + abs(v[i].y - v[j].y) <= AGREE ? 1 : 0;
+        }
+        if (c > bestCount) {
+            bestCount = c;
+            best = i;
+        }
+    }
+    int sx = 0, sy = 0, m = 0;
+    for (int k = 0; k < n; k++) {
+        if (abs(v[best].x - v[k].x) + abs(v[best].y - v[k].y) <= AGREE) {
+            sx += v[k].x;
+            sy += v[k].y;
+            m++;
+        }
+    }
     int4 o = int4(UNRELIABLE, 0, n | (checked << 16), 0);
-    if (n == 0) {
+    if (n == 0 || 2 * m <= n) {
+        // None passed, or no group holds the majority.
         o.w = 1;
     } else if (contrast[id.xy] < flatContrast) {
         o.w = 2;
     } else {
-        o.x = Quantize(clamp(sx * scale / n, -32767, 32767));
-        o.y = Quantize(clamp(sy * scale / n, -32767, 32767));
+        o.x = Quantize(clamp(sx * scale / m, -32767, 32767));
+        o.y = Quantize(clamp(sy * scale / m, -32767, 32767));
     }
     cells[id.xy] = o;
+}
+)";
+    // Setting "check against the surroundings", after kCellVectors: a reliable cell more than NBL
+    // (S10.5) off the median of the reliable cells around it (NBR cells each way, every NBS-th, the
+    // same eye) is made unreliable (w 3). On repetitive patterns the flow often matches a period
+    // off, and those cells disagree with the floor or wall they lie on (2026-10-16, Subnautica's
+    // grated floors). As NeighbourhoodCheckOnCpu.
+    static const char kNeighbourhoodCheck[] = R"(
+Texture2D<int4> cellsIn : register(t0);
+RWTexture2D<int4> cellsOut : register(u0);
+#define NBSIDE (2 * (NBR / NBS) + 1)
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint gw, gh;
+    cellsOut.GetDimensions(gw, gh);
+    if (id.x >= gw || id.y >= gh) return;
+    int4 c = cellsIn.Load(int3(id.xy, 0));
+    if (c.x != UNRELIABLE) {
+        const int half = int(gw) / 2;
+        const int x0 = int(id.x) < half ? 0 : half, x1 = int(id.x) < half ? half : int(gw);
+        int vx[NBSIDE * NBSIDE], vy[NBSIDE * NBSIDE];
+        int n = 0;
+        for (int dy = -NBR; dy <= NBR; dy += NBS) {
+            for (int dx = -NBR; dx <= NBR; dx += NBS) {
+                const int x = int(id.x) + dx, y = int(id.y) + dy;
+                if (x < x0 || x >= x1 || y < 0 || y >= int(gh)) continue;
+                const int4 o = cellsIn.Load(int3(x, y, 0));
+                if (o.x == UNRELIABLE) continue;
+                vx[n] = o.x;
+                vy[n] = o.y;
+                n++;
+            }
+        }
+        if (n >= NBMIN) {
+            // The values of rank n / 2, as std::nth_element finds them.
+            const int r = n / 2;
+            int mx = 0, my = 0;
+            for (int i = 0; i < n; i++) {
+                int lx = 0, ex = 0, ly = 0, ey = 0;
+                for (int j = 0; j < n; j++) {
+                    lx += vx[j] < vx[i] ? 1 : 0;
+                    ex += vx[j] == vx[i] ? 1 : 0;
+                    ly += vy[j] < vy[i] ? 1 : 0;
+                    ey += vy[j] == vy[i] ? 1 : 0;
+                }
+                if (lx <= r && r < lx + ex) mx = vx[i];
+                if (ly <= r && r < ly + ey) my = vy[i];
+            }
+            if (abs(c.x - mx) > NBL || abs(c.y - my) > NBL) {
+                c.x = UNRELIABLE;
+                c.y = 0;
+                c.w = 3;
+            }
+        }
+    }
+    cellsOut[id.xy] = c;
 }
 )";
     // The field the choice compares against, made on the GPU as the headset makes it from the
@@ -614,6 +713,157 @@ void main(uint3 id : SV_DispatchThreadID) {
     choice[id.xy] = chosen;
 }
 )";
+    // Setting "check repetitive patterns", after kNeighbourhoodCheck, kPatternPasses times. On grids
+    // and perforated plates optical flow locks onto matches one or more periods off, in groups of
+    // cells (Subnautica's floors, 2026-10-16: (16,16), (48,-12) px where the floor moved (-3,4)).
+    // Per cell the median of the reliable cells around (PTR each way, every PTS-th, same eye) is
+    // the prior; the frames are matched again around it (+-6 px in 2 px steps, then +-1 px: the
+    // cell's gray texels and one around, the older frame sampled at the vector). A reliable cell
+    // off the prior takes the match when it is within 2x (+1/255) of its own vector's, which a
+    // repetitive pattern always is (w 4); an unreliable cell takes it within 8/255 (w 5). Vectors:
+    // the newer frame's texel p is the older frame's p + v (S10.5 picture pixels).
+    static const char kPatternCheck[] = R"(
+Texture2D<int4> cellsIn : register(t0);
+Texture2D<float> newer : register(t1);
+Texture2D<float> older : register(t2);
+// The motion head rotation alone explains per cell (kRotation: newer minus older position, so the
+// negative of a vector), valid with haveRotation.
+Texture2D<float2> rotation : register(t3);
+cbuffer PatternParams : register(b0) {
+    int haveRotation;
+    int3 patternPad;
+};
+SamplerState linearClamp : register(s0);
+RWTexture2D<int4> cellsOut : register(u0);
+
+int Quantize(int v) {
+    const int steps = v >= 0 ? (v + STEP / 2) / STEP : -((-v + STEP / 2) / STEP);
+    return clamp(steps * STEP, -32764, 32764);
+}
+// Mean absolute difference over the cell's texels and one around, v in picture pixels.
+float Cost(int2 cell, float2 v, uint tw, uint th) {
+    const float2 off = v / SCALE;
+    float sum = 0;
+    for (int ty = -1; ty < CELL + 1; ty++) {
+        for (int tx = -1; tx < CELL + 1; tx++) {
+            const int2 t = clamp(cell * CELL + int2(tx, ty), int2(0, 0), int2(int(tw) - 1, int(th) - 1));
+            const float2 uv = (float2(t) + 0.5 + off) / float2(tw, th);
+            sum += abs(newer.Load(int3(t, 0)) - older.SampleLevel(linearClamp, uv, 0));
+        }
+    }
+    return sum / ((CELL + 2) * (CELL + 2));
+}
+// The median of the reliable cells within r (every s-th, the same eye); false with fewer than 5.
+// r / s is at most 2 (5x5 cells).
+bool Prior(int2 cell, int gw, int gh, int r, int s, out int2 m) {
+    const int half = gw / 2;
+    const int x0 = cell.x < half ? 0 : half, x1 = cell.x < half ? half : gw;
+    int vx[25], vy[25];
+    int n = 0;
+    for (int dy = -r; dy <= r; dy += s) {
+        for (int dx = -r; dx <= r; dx += s) {
+            const int x = cell.x + dx, y = cell.y + dy;
+            if (x < x0 || x >= x1 || y < 0 || y >= gh) continue;
+            const int4 o = cellsIn.Load(int3(x, y, 0));
+            if (o.x == UNRELIABLE) continue;
+            vx[n] = o.x;
+            vy[n] = o.y;
+            n++;
+        }
+    }
+    m = int2(0, 0);
+    if (n < 5) return false;
+    // The values of rank n / 2, as std::nth_element finds them.
+    const int k = n / 2;
+    for (int i = 0; i < n; i++) {
+        int lx = 0, ex = 0, ly = 0, ey = 0;
+        for (int j = 0; j < n; j++) {
+            lx += vx[j] < vx[i] ? 1 : 0;
+            ex += vx[j] == vx[i] ? 1 : 0;
+            ly += vy[j] < vy[i] ? 1 : 0;
+            ey += vy[j] == vy[i] ? 1 : 0;
+        }
+        if (lx <= k && k < lx + ex) m.x = vx[i];
+        if (ly <= k && k < ly + ey) m.y = vy[i];
+    }
+    return true;
+}
+// The best match within +-6 px of the prior (S10.5): 2 px steps, then +-1 px around the best.
+float2 Search(int2 cell, int2 prior, uint tw, uint th, out float best) {
+    const float2 p = float2(prior) / 32.0;
+    best = 1e30;
+    float2 bestV = p;
+    for (int sy = -6; sy <= 6; sy += 2) {
+        for (int sx = -6; sx <= 6; sx += 2) {
+            const float2 v = p + float2(sx, sy);
+            const float cost = Cost(cell, v, tw, th);
+            if (cost < best) { best = cost; bestV = v; }
+        }
+    }
+    const float2 centre = bestV;
+    for (int fy = -1; fy <= 1; fy++) {
+        for (int fx = -1; fx <= 1; fx++) {
+            if (fx == 0 && fy == 0) continue;
+            const float2 v = centre + float2(fx, fy);
+            const float cost = Cost(cell, v, tw, th);
+            if (cost < best) { best = cost; bestV = v; }
+        }
+    }
+    return bestV;
+}
+bool Near(int2 a, int2 b) {
+    return abs(a.x - b.x) <= 96 && abs(a.y - b.y) <= 96;
+}
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint gw, gh, tw, th;
+    cellsOut.GetDimensions(gw, gh);
+    newer.GetDimensions(tw, th);
+    if (id.x >= gw || id.y >= gh) return;
+    const int2 cell = int2(id.xy);
+    int4 c = cellsIn.Load(int3(cell, 0));
+    const bool reliable = c.x != UNRELIABLE;
+    int2 local;
+    const bool haveLocal = Prior(cell, int(gw), int(gh), PTR, PTS, local);
+    // A pattern area bigger than the local window can be a period off as a whole (a Subnautica hex
+    // floor, 16x26 cells 75 px off at a fast head turn, 2026-10-16), and then the local median is
+    // off too. Head rotation explains most of such motion to a few pixels (parallax aside): the
+    // motion it alone causes is a second prior, which wins ties.
+    const int2 turn = int2(round(-rotation.Load(int3(cell, 0)) * 32.0));
+    if (haveLocal) {
+        if (c.w == 2) {
+            // Flat: nothing to match, the surroundings' motion as it is.
+            c.xy = local;
+            c.w = 5;
+        } else {
+            const bool checkLocal = !reliable || !Near(c.xy, local);
+            const bool checkTurn = haveRotation != 0 && !Near(turn, local) && (!reliable || !Near(c.xy, turn));
+            if (checkLocal || checkTurn) {
+                float costLocal = 1e30, costTurn = 1e30;
+                float2 vLocal = float2(0, 0), vTurn = float2(0, 0);
+                if (checkLocal) vLocal = Search(cell, local, tw, th, costLocal);
+                if (checkTurn) vTurn = Search(cell, turn, tw, th, costTurn);
+                const bool useTurn = checkTurn && costTurn <= costLocal * 1.1 + 0.5 / 255.0;
+                const float best = useTurn ? costTurn : costLocal;
+                const float2 bestV = useTurn ? vTurn : vLocal;
+                // Against the cell's own vector the rotation prior must match more closely (1.25x):
+                // where the head also moved (parallax) it is a few pixels off, and in weak texture a
+                // looser bound would take it.
+                const float own = reliable ? Cost(cell, float2(c.xy) / 32.0, tw, th) : 0.0;
+                const bool take = reliable
+                    ? best <= own * (useTurn ? 1.25 : 2.0) + 1.0 / 255.0
+                    : best <= 8.0 / 255.0;
+                if (take) {
+                    c.x = Quantize(int(round(bestV.x * 32.0)));
+                    c.y = Quantize(int(round(bestV.y * 32.0)));
+                    c.w = reliable ? 4 : 5;
+                }
+            }
+        }
+    }
+    cellsOut[id.xy] = c;
+}
+)";
     using CompileFn = HRESULT(WINAPI*)(
         LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**
     );
@@ -622,16 +872,27 @@ void main(uint3 id : SV_DispatchThreadID) {
     // SCALE: picture pixels per gray texel; CELL: gray texels per cell.
     const std::string scaleText = std::to_string(m_scale), cellText = std::to_string(cellPixels / m_scale);
     // FLOWK: optical flow vectors per cell side; UNRELIABLE, STEP: as PyroWaveStripes.
-    const std::string flowKText = std::to_string(cellPixels / (kFlowGrid * m_scale));
+    const std::string flowKText = std::to_string(cellPixels / (m_flowGrid * m_scale));
+    const std::string flowGridText = std::to_string(m_flowGrid) + ".0";
+    // AGREE: vectors of a cell within 1.5 picture pixels of each other (L1, S10.5 of the flow input).
+    const std::string agreeText = std::to_string(48 / m_scale);
     const std::string unreliableText = std::to_string(int(PyroWaveStripes::MotionUnreliable));
     const std::string stepText = std::to_string(int(PyroWaveStripes::MotionStep));
+    const std::string nbrText = std::to_string(kNeighbourhoodRadius), nbsText = std::to_string(kNeighbourhoodStride);
+    const std::string nblText = std::to_string(kNeighbourhoodLimit), nbminText = std::to_string(kNeighbourhoodMin);
+    const std::string ptrText = std::to_string(kPatternRadius), ptsText = std::to_string(kPatternStride);
     struct Macro {
         const char* name;
         const char* definition;
     };
     const Macro macros[] = { { "SCALE", scaleText.c_str() },          { "CELL", cellText.c_str() },
                              { "FLOWK", flowKText.c_str() },          { "UNRELIABLE", unreliableText.c_str() },
-                             { "STEP", stepText.c_str() },            { nullptr, nullptr } };
+                             { "STEP", stepText.c_str() },            { "FLOWGRID", flowGridText.c_str() },
+                             { "AGREE", agreeText.c_str() },          { "NBR", nbrText.c_str() },
+                             { "NBS", nbsText.c_str() },              { "NBL", nblText.c_str() },
+                             { "NBMIN", nbminText.c_str() },          { "PTR", ptrText.c_str() },
+                             { "PTS", ptsText.c_str() },
+                             { nullptr, nullptr } };
     auto build = [&](const char* source, size_t size, const char* name, ComPtr<ID3D11ComputeShader>& shader) {
         ComPtr<ID3DBlob> code, errors;
         const bool ok = compile
@@ -644,6 +905,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         && build(kCellContrast, sizeof(kCellContrast) - 1, "CellContrast", m_cellContrast);
     // Without it the cells are made on the CPU as before.
     const bool cellsShaderOk = build(kCellVectors, sizeof(kCellVectors) - 1, "CellVectors", m_cellsCs);
+    const bool neighbourhoodShaderOk = Settings::Instance().m_pyroWaveMotionNeighbourhoodCheck
+        && build(kNeighbourhoodCheck, sizeof(kNeighbourhoodCheck) - 1, "NeighbourhoodCheck", m_neighbourhoodCs);
+    const bool patternShaderOk = Settings::Instance().m_pyroWaveMotionPatternCheck
+        && build(kPatternCheck, sizeof(kPatternCheck) - 1, "PatternCheck", m_patternCs);
     // Without it the vectors still go out, only the choice does not.
     const bool selectOk = build(kSelect, sizeof(kSelect) - 1, "SelectMotion", m_select)
         && build(kRotation, sizeof(kRotation) - 1, "RotationField", m_rotationCs)
@@ -673,7 +938,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     NV_OF_INIT_PARAMS init = {};
     init.width = (uint32_t)(width / m_scale);
     init.height = (uint32_t)(height / m_scale);
-    init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+    init.outGridSize = m_flowGrid == 1 ? NV_OF_OUTPUT_VECTOR_GRID_SIZE_1
+        : m_flowGrid == 2             ? NV_OF_OUTPUT_VECTOR_GRID_SIZE_2
+                                      : NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
     init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
     init.mode = NV_OF_MODE_OPTICALFLOW;
     // Setting "optical flow level"; slow is the best quality.
@@ -695,6 +962,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         init.predDirection = NV_OF_PRED_DIRECTION_FORWARD;
         status = m_api.nvOFInit(m_handle, &init);
     }
+    if (status != NV_OF_SUCCESS && m_flowGrid != 4) {
+        // A finer grid the driver does not offer: the usual one instead of no vectors at all.
+        Info("PyroWave motion vectors: optical flow grid %d not available (%d), using 4\n", m_flowGrid, (int)status);
+        Release();
+        m_flowGrid = 4;
+        return Initialize(device, context, frameFormat, width, height, cellPixels);
+    }
     if (status != NV_OF_SUCCESS) {
         Error("PyroWave motion vectors: optical flow init failed (%d), not sending them\n", (int)status);
         Release();
@@ -703,8 +977,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     m_width = width;
     m_height = height;
-    m_flowWidth = (width / m_scale + kFlowGrid - 1) / kFlowGrid;
-    m_flowHeight = (height / m_scale + kFlowGrid - 1) / kFlowGrid;
+    m_flowWidth = (width / m_scale + m_flowGrid - 1) / m_flowGrid;
+    m_flowHeight = (height / m_scale + m_flowGrid - 1) / m_flowGrid;
     m_cellPixels = cellPixels;
     m_gridWidth = width / cellPixels;
     m_gridHeight = (height + cellPixels - 1) / cellPixels;
@@ -809,7 +1083,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         cd.Format = DXGI_FORMAT_R32G32B32A32_SINT;
         cd.SampleDesc.Count = 1;
         cd.Usage = D3D11_USAGE_DEFAULT;
-        cd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        cd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
         D3D11_TEXTURE2D_DESC sd = cd;
         sd.Usage = D3D11_USAGE_STAGING;
         sd.BindFlags = 0;
@@ -834,6 +1108,51 @@ void main(uint3 id : SV_DispatchThreadID) {
             && SUCCEEDED(device->CreateTexture2D(&sd, nullptr, &m_cellsStaging))
             && SUCCEEDED(device->CreateBuffer(&pd, &pdData, &m_cellsParams));
         Info("PyroWave motion vectors: cells made on the %s\n", m_gpuCells ? "GPU" : "CPU");
+        // The check against the surroundings writes the cells anew; on the CPU (after the readback)
+        // when the GPU cannot.
+        m_neighbourhoodCheck = Settings::Instance().m_pyroWaveMotionNeighbourhoodCheck;
+        if (!m_gpuCells || !neighbourhoodShaderOk
+            || FAILED(device->CreateShaderResourceView(m_cells.Get(), nullptr, &m_cellsSrv))
+            || FAILED(device->CreateTexture2D(&cd, nullptr, &m_cellsChecked))
+            || FAILED(device->CreateUnorderedAccessView(m_cellsChecked.Get(), nullptr, &m_cellsCheckedUav))) {
+            m_neighbourhoodCs.Reset();
+            m_cellsSrv.Reset();
+            m_cellsChecked.Reset();
+            m_cellsCheckedUav.Reset();
+        }
+        Info(
+            "PyroWave motion vectors: check against the surroundings %s\n",
+            !m_neighbourhoodCheck ? "off (setting)" : m_neighbourhoodCs ? "on the GPU" : "on the CPU"
+        );
+        // The pattern check ping-pongs between m_cells and m_cellsChecked (made above, or here when
+        // the check against the surroundings is off). GPU only.
+        D3D11_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler.MaxLOD = D3D11_FLOAT32_MAX;
+        m_patternCheck = Settings::Instance().m_pyroWaveMotionPatternCheck && m_gpuCells && patternShaderOk
+            && (m_cellsSrv || SUCCEEDED(device->CreateShaderResourceView(m_cells.Get(), nullptr, &m_cellsSrv)))
+            && (m_cellsChecked || SUCCEEDED(device->CreateTexture2D(&cd, nullptr, &m_cellsChecked)))
+            && (m_cellsCheckedUav || SUCCEEDED(device->CreateUnorderedAccessView(m_cellsChecked.Get(), nullptr, &m_cellsCheckedUav)))
+            && SUCCEEDED(device->CreateShaderResourceView(m_cellsChecked.Get(), nullptr, &m_cellsCheckedSrv))
+            && SUCCEEDED(device->CreateSamplerState(&sampler, &m_patternSampler));
+        D3D11_BUFFER_DESC patternParams = {};
+        patternParams.ByteWidth = 16;
+        patternParams.Usage = D3D11_USAGE_DYNAMIC;
+        patternParams.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        patternParams.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        m_patternCheck = m_patternCheck && SUCCEEDED(device->CreateBuffer(&patternParams, nullptr, &m_patternParams));
+        if (m_patternCheck) {
+            // The CPU makes the cells without it, so they would differ: not compared.
+            m_validateFrames = 0;
+        } else {
+            m_patternCs.Reset();
+        }
+        Info(
+            "PyroWave motion vectors: check of repetitive patterns %s\n",
+            m_patternCheck ? "on the GPU, 4 passes"
+                : Settings::Instance().m_pyroWaveMotionPatternCheck ? "unavailable (needs the GPU cells)" : "off (setting)"
+        );
     }
     // Motion choice resources (setting "Send motion choice"): the vectors as uploaded, the field
     // the GPU makes from them, the choice per block and its readback.
@@ -929,10 +1248,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     m_context = context;
     m_statStartMs = NowMs();
     Info(
-        "PyroWave motion vectors: optical flow level %s, %s, on the luma at 1/%d resolution\n",
+        "PyroWave motion vectors: optical flow level %s, %s, on the luma at 1/%d resolution, grid %d\n",
         init.perfLevel == NV_OF_PERF_LEVEL_FAST ? "fast" : init.perfLevel == NV_OF_PERF_LEVEL_MEDIUM ? "medium" : "slow",
         m_bidirectional ? "both directions (checked)" : "forward only",
-        m_scale
+        m_scale,
+        m_flowGrid
     );
     Info(
         "PyroWave motion vectors: NVIDIA Optical Flow ready, %dx%d, vectors every %d pixels (%dx%d, "
@@ -996,7 +1316,13 @@ void PyroWaveMotion::Submit(ID3D11Texture2D* frame, uint64_t timestampNs) {
         NV_OF_EXECUTE_OUTPUT_PARAMS out = {};
         out.outputBuffer = m_outputHandle;
         out.bwdOutputBuffer = m_bidirectional ? m_backwardHandle : nullptr;
-        if (m_api.nvOFExecute(m_handle, &in, &out) == NV_OF_SUCCESS) {
+        const NV_OF_STATUS status = m_api.nvOFExecute(m_handle, &in, &out);
+        static int failuresReported = 0;
+        if (status != NV_OF_SUCCESS && failuresReported < 5) {
+            failuresReported++;
+            Warn("PyroWave motion vectors: nvOFExecute failed with status %d (grid %d)\n", (int)status, m_flowGrid);
+        }
+        if (status == NV_OF_SUCCESS) {
             if (timed) {
                 m_context->End(m_ts[2].Get());
             }
@@ -1015,8 +1341,69 @@ void PyroWaveMotion::Submit(ID3D11Texture2D* frame, uint64_t timestampNs) {
                 m_context->CSSetShaderResources(0, 3, noSrvs);
                 m_context->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
                 m_context->CSSetConstantBuffers(0, 1, &noCb);
+                if (m_neighbourhoodCs) {
+                    ID3D11ShaderResourceView* cellsSrv = m_cellsSrv.Get();
+                    ID3D11UnorderedAccessView* checkedUav = m_cellsCheckedUav.Get();
+                    m_context->CSSetShader(m_neighbourhoodCs.Get(), nullptr, 0);
+                    m_context->CSSetShaderResources(0, 1, &cellsSrv);
+                    m_context->CSSetUnorderedAccessViews(0, 1, &checkedUav, nullptr);
+                    m_context->Dispatch((UINT)((m_gridWidth + 7) / 8), (UINT)((m_gridHeight + 7) / 8), 1);
+                    m_context->CSSetShaderResources(0, 1, &noSrv);
+                    m_context->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+                }
+                // Where the cells are now; the pattern check passes go back and forth from there.
+                bool inChecked = m_neighbourhoodCs != nullptr;
+                if (m_patternCheck) {
+                    // The head rotation field of the two frames as a second prior, when the motion
+                    // choice's resources and both frames' poses are there.
+                    int haveRotation = 0;
+                    if (m_rotationCs && m_rotationUav && m_lutView
+                        && WriteFieldParams(m_inputTimestamps[reference], timestampNs) == 2) {
+                        ID3D11Buffer* fieldCb = m_fieldParams.Get();
+                        ID3D11ShaderResourceView* lut = m_lutView.Get();
+                        ID3D11UnorderedAccessView* rotationUav = m_rotationUav.Get();
+                        m_context->CSSetShader(m_rotationCs.Get(), nullptr, 0);
+                        m_context->CSSetConstantBuffers(0, 1, &fieldCb);
+                        m_context->CSSetShaderResources(0, 1, &lut);
+                        m_context->CSSetUnorderedAccessViews(0, 1, &rotationUav, nullptr);
+                        m_context->Dispatch((UINT)((m_gridWidth + 15) / 16), (UINT)((m_gridHeight + 7) / 8), 1);
+                        m_context->CSSetShaderResources(0, 1, &noSrv);
+                        m_context->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+                        haveRotation = 1;
+                        m_statPatternRotationFrames++;
+                    }
+                    D3D11_MAPPED_SUBRESOURCE mappedParams = {};
+                    if (SUCCEEDED(m_context->Map(m_patternParams.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedParams))) {
+                        const int params[4] = { haveRotation, 0, 0, 0 };
+                        std::memcpy(mappedParams.pData, params, sizeof(params));
+                        m_context->Unmap(m_patternParams.Get(), 0);
+                    }
+                    ID3D11Buffer* patternCb = m_patternParams.Get();
+                    ID3D11ShaderResourceView* grays[3] = {
+                        m_inputSrvs[m_current].Get(), m_inputSrvs[1 - m_current].Get(), haveRotation ? m_rotationView.Get() : nullptr
+                    };
+                    ID3D11ShaderResourceView* noGrays[4] = {};
+                    ID3D11SamplerState* sampler = m_patternSampler.Get();
+                    m_context->CSSetShader(m_patternCs.Get(), nullptr, 0);
+                    m_context->CSSetConstantBuffers(0, 1, &patternCb);
+                    m_context->CSSetShaderResources(1, 3, grays);
+                    m_context->CSSetSamplers(0, 1, &sampler);
+                    for (int pass = 0; pass < kPatternPasses; pass++) {
+                        ID3D11ShaderResourceView* in = inChecked ? m_cellsCheckedSrv.Get() : m_cellsSrv.Get();
+                        ID3D11UnorderedAccessView* out = inChecked ? m_cellsUav.Get() : m_cellsCheckedUav.Get();
+                        m_context->CSSetShaderResources(0, 1, &in);
+                        m_context->CSSetUnorderedAccessViews(0, 1, &out, nullptr);
+                        m_context->Dispatch((UINT)((m_gridWidth + 7) / 8), (UINT)((m_gridHeight + 7) / 8), 1);
+                        m_context->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+                        m_context->CSSetShaderResources(0, 1, &noSrv);
+                        inChecked = !inChecked;
+                    }
+                    m_context->CSSetShaderResources(0, 4, noGrays);
+                    ID3D11Buffer* noPatternCb = nullptr;
+                    m_context->CSSetConstantBuffers(0, 1, &noPatternCb);
+                }
                 m_context->CSSetShader(nullptr, nullptr, 0);
-                m_context->CopyResource(m_cellsStaging.Get(), m_cells.Get());
+                m_context->CopyResource(m_cellsStaging.Get(), inChecked ? m_cellsChecked.Get() : m_cells.Get());
             }
             if (!m_gpuCells || m_validateFrames > 0) {
                 m_context->CopyResource(m_staging.Get(), m_output.Get());
@@ -1064,11 +1451,59 @@ bool PyroWaveMotion::CellsOnGpu() {
             m_statVectors += uint32_t(c[2]) >> 16;
             m_statInconsistentCells += c[3] == 1;
             m_statFlatCells += c[3] == 2;
+            m_statNeighbourhoodCells += c[3] == 3;
+            m_statPatternCells += c[3] == 4 || c[3] == 5;
         }
     }
     m_context->Unmap(m_cellsStaging.Get(), 0);
     m_statCells += uint64_t(m_gridWidth) * m_gridHeight;
+    if (m_neighbourhoodCheck && !m_neighbourhoodCs) {
+        NeighbourhoodCheckOnCpu(m_grid, true);
+    }
     return true;
+}
+
+// kNeighbourhoodCheck on the CPU, on the rounded cells (the same values the GPU checks).
+void PyroWaveMotion::NeighbourhoodCheckOnCpu(std::vector<int16_t>& grid, bool stats) {
+    const std::vector<int16_t> src = grid;
+    const int half = m_gridWidth / 2;
+    std::vector<int> vx, vy;
+    for (int gy = 0; gy < m_gridHeight; gy++) {
+        for (int gx = 0; gx < m_gridWidth; gx++) {
+            const size_t i = 2 * (size_t(gy) * m_gridWidth + gx);
+            if (src[i] == PyroWaveStripes::MotionUnreliable) {
+                continue;
+            }
+            const int x0 = gx < half ? 0 : half, x1 = gx < half ? half : m_gridWidth;
+            vx.clear();
+            vy.clear();
+            for (int dy = -kNeighbourhoodRadius; dy <= kNeighbourhoodRadius; dy += kNeighbourhoodStride) {
+                for (int dx = -kNeighbourhoodRadius; dx <= kNeighbourhoodRadius; dx += kNeighbourhoodStride) {
+                    const int x = gx + dx, y = gy + dy;
+                    if (x < x0 || x >= x1 || y < 0 || y >= m_gridHeight) {
+                        continue;
+                    }
+                    const size_t j = 2 * (size_t(y) * m_gridWidth + x);
+                    if (src[j] == PyroWaveStripes::MotionUnreliable) {
+                        continue;
+                    }
+                    vx.push_back(src[j]);
+                    vy.push_back(src[j + 1]);
+                }
+            }
+            if ((int)vx.size() < kNeighbourhoodMin) {
+                continue;
+            }
+            std::nth_element(vx.begin(), vx.begin() + vx.size() / 2, vx.end());
+            std::nth_element(vy.begin(), vy.begin() + vy.size() / 2, vy.end());
+            if (std::abs(src[i] - vx[vx.size() / 2]) > kNeighbourhoodLimit
+                || std::abs(src[i + 1] - vy[vy.size() / 2]) > kNeighbourhoodLimit) {
+                grid[i] = PyroWaveStripes::MotionUnreliable;
+                grid[i + 1] = 0;
+                if (stats) m_statNeighbourhoodCells++;
+            }
+        }
+    }
 }
 
 // The cells from the flow readback, on the CPU (without the GPU cells, and to check them).
@@ -1084,20 +1519,24 @@ bool PyroWaveMotion::CellsOnCpu(std::vector<int16_t>& grid, bool stats) {
         return reinterpret_cast<const int16_t*>(static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch)
             + 2 * x;
     };
-    // Average the consistent 4x4 pixel vectors of each cell (S10.5 stays S10.5). A vector is
-    // consistent when the backward flow where it points comes back to within a pixel (or 15 % of
-    // its length) of its start.
-    const int k = m_cellPixels / (kFlowGrid * m_scale);
+    // Per cell the consistent vectors (S10.5 stays S10.5), and of them the mean of the largest
+    // group that agrees within 1.5 picture pixels, if it is the majority (as kCellVectors). A
+    // vector is consistent when the backward flow where it points comes back to within a pixel (or
+    // 15 % of its length) of its start.
+    const int k = m_cellPixels / (m_flowGrid * m_scale);
+    const int agree = 48 / m_scale;
+    std::vector<std::pair<int, int>> v;
     for (int gy = 0; gy < m_gridHeight; gy++) {
         for (int gx = 0; gx < m_gridWidth; gx++) {
-            int32_t sx = 0, sy = 0, n = 0;
+            int32_t n = 0;
+            v.clear();
             for (int y = gy * k; y < std::min((gy + 1) * k, m_flowHeight); y++) {
                 for (int x = gx * k; x < (gx + 1) * k; x++) {
                     const int16_t* f = vectorAt(mapped, x, y);
                     if (check) {
                         const float fx = f[0] / 32.0f, fy = f[1] / 32.0f;
-                        const int bx = std::clamp(x + (int)std::lround(fx / kFlowGrid), 0, m_flowWidth - 1);
-                        const int by = std::clamp(y + (int)std::lround(fy / kFlowGrid), 0, m_flowHeight - 1);
+                        const int bx = std::clamp(x + (int)std::lround(fx / m_flowGrid), 0, m_flowWidth - 1);
+                        const int by = std::clamp(y + (int)std::lround(fy / m_flowGrid), 0, m_flowHeight - 1);
                         const int16_t* b = vectorAt(backward, bx, by);
                         const float ex = fx + b[0] / 32.0f, ey = fy + b[1] / 32.0f;
                         if (stats) m_statVectors++;
@@ -1105,22 +1544,43 @@ bool PyroWaveMotion::CellsOnCpu(std::vector<int16_t>& grid, bool stats) {
                             continue;
                         }
                     }
-                    sx += f[0];
-                    sy += f[1];
+                    v.emplace_back(f[0], f[1]);
                     n++;
                 }
             }
+            auto agrees = [&](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                return std::abs(a.first - b.first) + std::abs(a.second - b.second) <= agree;
+            };
+            int best = 0, bestCount = 0;
+            for (int a = 0; a < n; a++) {
+                int c = 0;
+                for (int b = 0; b < n; b++) {
+                    c += agrees(v[a], v[b]) ? 1 : 0;
+                }
+                if (c > bestCount) {
+                    bestCount = c;
+                    best = a;
+                }
+            }
+            int32_t sx = 0, sy = 0, m = 0;
+            for (int b = 0; b < n; b++) {
+                if (agrees(v[best], v[b])) {
+                    sx += v[b].first;
+                    sy += v[b].second;
+                    m++;
+                }
+            }
+            if (stats) m_statConsistentVectors += n;
             const size_t i = 2 * (size_t(gy) * m_gridWidth + gx);
-            if (n == 0) {
+            if (n == 0 || 2 * m <= n) {
                 grid[i] = PyroWaveStripes::MotionUnreliable;
                 grid[i + 1] = 0;
                 if (stats) m_statInconsistentCells++;
                 continue;
             }
             // Back to full resolution pixels, still S10.5 (x never reaches MotionUnreliable).
-            grid[i] = int16_t(std::clamp(sx * m_scale / n, -32767, 32767));
-            grid[i + 1] = int16_t(std::clamp(sy * m_scale / n, -32767, 32767));
-            if (stats) m_statConsistentVectors += n;
+            grid[i] = int16_t(std::clamp(sx * m_scale / m, -32767, 32767));
+            grid[i + 1] = int16_t(std::clamp(sy * m_scale / m, -32767, 32767));
         }
     }
     m_context->Unmap(m_staging.Get(), 0);
@@ -1158,6 +1618,9 @@ bool PyroWaveMotion::CellsOnCpu(std::vector<int16_t>& grid, bool stats) {
                 grid[i + c] = int16_t(std::clamp<long>(steps * PyroWaveStripes::MotionStep, -32764, 32764));
             }
         }
+    }
+    if (m_neighbourhoodCheck) {
+        NeighbourhoodCheckOnCpu(grid, stats);
     }
     return true;
 }
@@ -1265,39 +1728,12 @@ bool PyroWaveMotion::Collect(
 }
 
 void PyroWaveMotion::DispatchChoice() {
-    // Head rotation between the two frames, from the poses the headset sent for them (what its
-    // FramePoseHistory holds): older^-1 * newer takes directions in the newer frame's eye space into
-    // the older frame's. Identity without poses.
-    std::shared_ptr<PoseHistory> poses;
-    float tangents[2][4];
-    bool haveTangents;
-    {
-        std::lock_guard<std::mutex> lock(g_choiceMutex);
-        poses = g_poseHistory;
-        std::memcpy(tangents, g_tangents, sizeof(tangents));
-        haveTangents = g_haveTangents;
-    }
-    if (!haveTangents) {
+    if (WriteFieldParams(m_pendingReference, m_pendingTimestamp) == 0) {
         return;
     }
-    float r[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-    const auto older = poses ? poses->GetPoseAt(m_pendingReference) : std::nullopt;
-    const auto newer = poses ? poses->GetPoseAt(m_pendingTimestamp) : std::nullopt;
-    if (older && newer) {
-        const FfiQuat& a = older->motion.orientation;
-        const FfiQuat& b = newer->motion.orientation;
-        const float ax = -a.x, ay = -a.y, az = -a.z, aw = a.w;
-        const float q[4] = {
-            aw * b.x + ax * b.w + ay * b.z - az * b.y,
-            aw * b.y - ax * b.z + ay * b.w + az * b.x,
-            aw * b.z + ax * b.y - ay * b.x + az * b.w,
-            aw * b.w - ax * b.x - ay * b.y - az * b.z,
-        };
-        QuatToMatrix(q, r);
-    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
 
     // The vectors as the headset reads them: motion is their negative, b = 1 where reliable.
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(m_context->Map(m_motionUpload.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         return;
     }
@@ -1313,6 +1749,44 @@ void PyroWaveMotion::DispatchChoice() {
         }
     }
     m_context->Unmap(m_motionUpload.Get(), 0);
+    DispatchChoicePasses();
+}
+
+// The field parameters for two frames (kRotation and the field passes): 0 without the view
+// tangents (nothing to compute), 1 with the identity rotation (no poses for them), 2 with the head
+// rotation between them.
+int PyroWaveMotion::WriteFieldParams(uint64_t olderTimestamp, uint64_t newerTimestamp) {
+    // Head rotation between the two frames, from the poses the headset sent for them (what its
+    // FramePoseHistory holds): older^-1 * newer takes directions in the newer frame's eye space into
+    // the older frame's. Identity without poses.
+    std::shared_ptr<PoseHistory> poses;
+    float tangents[2][4];
+    bool haveTangents;
+    {
+        std::lock_guard<std::mutex> lock(g_choiceMutex);
+        poses = g_poseHistory;
+        std::memcpy(tangents, g_tangents, sizeof(tangents));
+        haveTangents = g_haveTangents;
+    }
+    if (!haveTangents || !m_fieldParams) {
+        return 0;
+    }
+    float r[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const auto older = poses ? poses->GetPoseAt(olderTimestamp) : std::nullopt;
+    const auto newer = poses ? poses->GetPoseAt(newerTimestamp) : std::nullopt;
+    const bool rotated = older && newer;
+    if (older && newer) {
+        const FfiQuat& a = older->motion.orientation;
+        const FfiQuat& b = newer->motion.orientation;
+        const float ax = -a.x, ay = -a.y, az = -a.z, aw = a.w;
+        const float q[4] = {
+            aw * b.x + ax * b.w + ay * b.z - az * b.y,
+            aw * b.y - ax * b.z + ay * b.w + az * b.x,
+            aw * b.z + ax * b.y - ay * b.x + az * b.w,
+            aw * b.w - ax * b.x - ay * b.y - az * b.z,
+        };
+        QuatToMatrix(q, r);
+    }
 
     struct FieldParams {
         float rot0[4], rot1[4], rot2[4];
@@ -1324,8 +1798,9 @@ void PyroWaveMotion::DispatchChoice() {
         float deadzone;
     };
     static_assert(sizeof(FieldParams) == 112, "FieldParams layout");
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(m_context->Map(m_fieldParams.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        return;
+        return 0;
     }
     FieldParams fp = {};
     for (int i = 0; i < 3; i++) {
@@ -1346,7 +1821,12 @@ void PyroWaveMotion::DispatchChoice() {
     fp.deadzone = kDeadzone;
     std::memcpy(mapped.pData, &fp, sizeof(fp));
     m_context->Unmap(m_fieldParams.Get(), 0);
+    return rotated ? 2 : 1;
+}
 
+// The choice's GPU passes, after WriteFieldParams and the upload of the vectors.
+void PyroWaveMotion::DispatchChoicePasses() {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
     struct SelectParams {
         float frameSize[2];
         float cellPixels;
@@ -1486,7 +1966,8 @@ void PyroWaveMotion::ReportIfDue() {
     Info(
         "PyroWave motion vectors: %llu frames in %.1f s, ready %.2f ms avg %.2f max after the copy, "
         "%llu too late, %.0f KB per frame; cells sent as unreliable: %.0f %% flat, %.0f %% without a "
-        "vector passing the forward-backward check (%.0f %% of all vectors passed)\n",
+        "vector passing the forward-backward check or without a majority among them (%.0f %% of all "
+        "vectors passed), %.1f %% off their surroundings, %.1f %% set by the pattern check (head rotation known in %llu frames)\n",
         (unsigned long long)m_statFrames,
         (now - m_statStartMs) / 1000.0,
         m_statReadyMs / frames,
@@ -1495,7 +1976,10 @@ void PyroWaveMotion::ReportIfDue() {
         m_statBytes / frames / 1024.0,
         m_statCells ? 100.0 * double(m_statFlatCells) / double(m_statCells) : 0.0,
         m_statCells ? 100.0 * double(m_statInconsistentCells) / double(m_statCells) : 0.0,
-        m_statVectors ? 100.0 * double(m_statConsistentVectors) / double(m_statVectors) : 100.0
+        m_statVectors ? 100.0 * double(m_statConsistentVectors) / double(m_statVectors) : 100.0,
+        m_statCells ? 100.0 * double(m_statNeighbourhoodCells) / double(m_statCells) : 0.0,
+        m_statCells ? 100.0 * double(m_statPatternCells) / double(m_statCells) : 0.0,
+        (unsigned long long)m_statPatternRotationFrames
     );
     if (m_statTimed > 0) {
         // Where "ready after the copy" goes: the stages' own GPU time, and the rest of the time from
@@ -1503,9 +1987,10 @@ void PyroWaveMotion::ReportIfDue() {
         // what the D3D11 queue holds before it).
         const double n = double(m_statTimed);
         Info(
-            "PyroWave motion vectors, GPU: %llu frames timed, copy+luma+contrast %.2f ms, optical flow "
-            "%.2f ms, cells+readback %.2f ms, together %.2f ms avg %.2f max; recording %.2f ms on the CPU; "
-            "waiting %.2f ms avg until the result was read\n",
+            "PyroWave motion vectors, GPU (grid %d): %llu frames timed, copy+luma+contrast %.2f ms, "
+            "optical flow %.2f ms, cells+readback %.2f ms, together %.2f ms avg %.2f max; recording %.2f ms "
+            "on the CPU; waiting %.2f ms avg until the result was read\n",
+            m_flowGrid,
             (unsigned long long)m_statTimed,
             m_statStageMs[0] / n,
             m_statStageMs[1] / n,
@@ -1533,6 +2018,9 @@ void PyroWaveMotion::ReportIfDue() {
     m_statVectors = 0;
     m_statConsistentVectors = 0;
     m_statInconsistentCells = 0;
+    m_statNeighbourhoodCells = 0;
+    m_statPatternCells = 0;
+    m_statPatternRotationFrames = 0;
 }
 
 void PyroWaveMotion::Release() {
@@ -1594,6 +2082,14 @@ void PyroWaveMotion::Release() {
     m_contrast.Reset();
     m_contrastStaging.Reset();
     m_cellsStaging.Reset();
+    m_cellsCheckedUav.Reset();
+    m_cellsChecked.Reset();
+    m_cellsSrv.Reset();
+    m_neighbourhoodCs.Reset();
+    m_patternCs.Reset();
+    m_patternSampler.Reset();
+    m_patternParams.Reset();
+    m_cellsCheckedSrv.Reset();
     m_cellsUav.Reset();
     m_cells.Reset();
     m_contrastSrv.Reset();

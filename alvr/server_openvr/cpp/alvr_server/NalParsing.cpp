@@ -118,6 +118,57 @@ void ParseFrameNals(
     VideoSend(targetTimestampNs, buf, len, isIdr);
 }
 
+void ParseFrameNalsMultiview(
+    const unsigned char* const* views,
+    const int* lengths,
+    int count,
+    unsigned long long targetTimestampNs,
+    bool isIdr
+) {
+    static const unsigned char HEVC_NAL_TYPE_SPS = 33, HEVC_NAL_TYPE_PPS = 34;
+    static std::vector<unsigned char> config, frame;
+    config.clear();
+    frame.clear();
+    for (int v = 0; v < count; v++) {
+        const unsigned char* buf = views[v];
+        const int len = lengths[v];
+        // The NAL units of this view's output, each written back with a 4 byte start code.
+        int i = 0;
+        while (i + 3 <= len) {
+            if (!(buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)) {
+                i++;
+                continue;
+            }
+            const int start = i + 3;
+            int end = start;
+            while (end + 3 <= len && !(buf[end] == 0 && buf[end + 1] == 0 && (buf[end + 2] == 1 || (buf[end + 2] == 0 && end + 3 < len && buf[end + 3] == 1)))) {
+                end++;
+            }
+            if (end + 3 > len) {
+                end = len;
+            }
+            i = end;
+            if (end - start < 2) {
+                continue;
+            }
+            const unsigned char type = (buf[start] >> 1) & 0x3F;
+            // One access unit delimiter per access unit: the second view's is left out.
+            if (type == HEVC_NAL_TYPE_AUD && v > 0) {
+                continue;
+            }
+            auto& out = type == HEVC_NAL_TYPE_VPS || type == HEVC_NAL_TYPE_SPS || type == HEVC_NAL_TYPE_PPS ? config : frame;
+            out.insert(out.end(), NAL_PREFIX_4B, NAL_PREFIX_4B + sizeof(NAL_PREFIX_4B));
+            out.insert(out.end(), buf + start, buf + end);
+        }
+    }
+    if (!config.empty()) {
+        SetVideoConfigNals(config.data(), (int)config.size(), ALVR_CODEC_HEVC);
+    }
+    if (!frame.empty()) {
+        VideoSend(targetTimestampNs, frame.data(), (int)frame.size(), isIdr);
+    }
+}
+
 void ParseFrameNalsOfEye(
     int codec,
     unsigned char* buf,

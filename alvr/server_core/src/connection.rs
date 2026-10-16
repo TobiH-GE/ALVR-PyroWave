@@ -358,6 +358,13 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
             .encoder_config
             .pyrowave
             .motion_vectors_quarter_resolution,
+        pyrowave_motion_vectors_grid: settings.video.encoder_config.pyrowave.motion_vectors_grid.clone() as u32,
+        pyrowave_motion_vectors_neighbourhood_check: settings
+            .video
+            .encoder_config
+            .pyrowave
+            .motion_vectors_neighbourhood_check,
+        pyrowave_motion_vectors_pattern_check: settings.video.encoder_config.pyrowave.motion_vectors_pattern_check,
         controllers_enabled,
         controller_is_tracker,
         body_tracking_vive_enabled,
@@ -398,6 +405,7 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         nvenc_center_qp_offset,
         nvenc_edge_qp_offset,
         nvenc_split_eyes: nvenc_overrides.split_eyes,
+        nvenc_mv_hevc: nvenc_overrides.mv_hevc,
         capture_frame_dir: settings.extra.capture.capture_frame_dir,
         amd_bitrate_corruption_fix: settings.video.bitrate.image_corruption_fix,
         use_separate_hand_trackers,

@@ -109,6 +109,26 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cells;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_cellsUav;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cellsStaging;
+    // Setting "check against the surroundings" (kNeighbourhoodCheck, NeighbourhoodCheckOnCpu): cells
+    // far off the median of the reliable cells around them become unreliable.
+    bool m_neighbourhoodCheck = false;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_neighbourhoodCs;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_cellsSrv;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cellsChecked;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_cellsCheckedUav;
+    void NeighbourhoodCheckOnCpu(std::vector<int16_t>& grid, bool stats);
+    // Setting "check repetitive patterns" (kPatternCheck, GPU only): kPatternPasses passes, ping-pong
+    // between m_cells and m_cellsChecked, on the gray inputs of the two frames.
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_patternCs;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_patternSampler;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_cellsCheckedSrv;
+    // haveRotation for kPatternCheck: the head rotation field (kRotation, from the choice's
+    // resources) is a second prior when the poses of both frames are known.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_patternParams;
+    bool m_patternCheck = false;
+    uint64_t m_statPatternRotationFrames = 0;
+    int WriteFieldParams(uint64_t olderTimestamp, uint64_t newerTimestamp);
+    void DispatchChoicePasses();
     // The first frames are made on the CPU as well and compared (logged once).
     int m_validateFrames = 30;
     std::vector<int16_t> m_validateGrid;
@@ -116,6 +136,9 @@ private:
     size_t m_validateDiffer = 0;
     bool CellsOnCpu(std::vector<int16_t>& grid, bool stats);
     bool CellsOnGpu();
+
+    // Input texels per optical flow vector (setting "optical flow grid": 4, 2 or 1).
+    int m_flowGrid = 0; // 0 until Initialize takes the setting
 
     // The current and the previous frame, in turn.
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_inputs[2];
@@ -174,6 +197,8 @@ private:
     uint64_t m_statVectors = 0;
     uint64_t m_statConsistentVectors = 0;
     uint64_t m_statInconsistentCells = 0;
+    uint64_t m_statNeighbourhoodCells = 0;
+    uint64_t m_statPatternCells = 0;
 
     // Motion choice, all on the GPU: the field as the headset makes it from the vectors (head
     // rotation per cell, unreliable cells filled, 3x3 median with the rotation taken out, dead

@@ -196,6 +196,16 @@ void ParseFrameNalsOfEye(
     bool firstPiece,
     bool lastPiece
 );
+// MV-HEVC (NVENC "MV-HEVC"): the outputs of a frame's views (view 0 first) as one access unit.
+// The parameter sets of both layers become the client's decoder configuration (VPS, SPS and PPS
+// of layer 0, then SPS and PPS of layer 1) and are left out of the frame.
+void ParseFrameNalsMultiview(
+    const unsigned char* const* views,
+    const int* lengths,
+    int count,
+    unsigned long long targetTimestampNs,
+    bool isIdr
+);
 
 // CrashHandler.cpp
 void HookCrashHandler();

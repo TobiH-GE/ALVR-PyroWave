@@ -164,7 +164,8 @@ void NvEncoder::CreateDefaultEncoderParams(NV_ENC_INITIALIZE_PARAMS* pIntializeP
     }
 #endif
 
-    NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER, { NV_ENC_CONFIG_VER } };
+    NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER };
+    presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
     m_nvenc.nvEncGetEncodePresetConfig(m_hEncoder, codecGuid, presetGuid, &presetConfig);
     memcpy(pIntializeParams->encodeConfig, &presetConfig.presetCfg, sizeof(NV_ENC_CONFIG));
     pIntializeParams->encodeConfig->frameIntervalP = 1;
@@ -175,7 +176,8 @@ void NvEncoder::CreateDefaultEncoderParams(NV_ENC_INITIALIZE_PARAMS* pIntializeP
     if (!m_bMotionEstimationOnly)
     {
         pIntializeParams->tuningInfo = tuningInfo;
-        NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER, { NV_ENC_CONFIG_VER } };
+        NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER };
+        presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
         m_nvenc.nvEncGetEncodePresetConfigEx(m_hEncoder, codecGuid, presetGuid, tuningInfo, &presetConfig);
         memcpy(pIntializeParams->encodeConfig, &presetConfig.presetCfg, sizeof(NV_ENC_CONFIG));
     }
@@ -196,8 +198,8 @@ void NvEncoder::CreateDefaultEncoderParams(NV_ENC_INITIALIZE_PARAMS* pIntializeP
     }
     else if (pIntializeParams->encodeGUID == NV_ENC_CODEC_HEVC_GUID)
     {
-        pIntializeParams->encodeConfig->encodeCodecConfig.hevcConfig.pixelBitDepthMinus8 =
-            (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT || m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV444_10BIT ) ? 2 : 0;
+        pIntializeParams->encodeConfig->encodeCodecConfig.hevcConfig.inputBitDepth = pIntializeParams->encodeConfig->encodeCodecConfig.hevcConfig.outputBitDepth =
+            (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT || m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV444_10BIT ) ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
         if (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV444 || m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV444_10BIT)
         {
             pIntializeParams->encodeConfig->encodeCodecConfig.hevcConfig.chromaFormatIDC = 3;
@@ -206,8 +208,8 @@ void NvEncoder::CreateDefaultEncoderParams(NV_ENC_INITIALIZE_PARAMS* pIntializeP
     }
     else if (pIntializeParams->encodeGUID == NV_ENC_CODEC_AV1_GUID)
     {
-        pIntializeParams->encodeConfig->encodeCodecConfig.av1Config.pixelBitDepthMinus8 = (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 2 : 0;
-		pIntializeParams->encodeConfig->encodeCodecConfig.av1Config.inputPixelBitDepthMinus8 = (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? 2 : 0;
+        pIntializeParams->encodeConfig->encodeCodecConfig.av1Config.outputBitDepth = (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+		pIntializeParams->encodeConfig->encodeCodecConfig.av1Config.inputBitDepth = (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
         pIntializeParams->encodeConfig->encodeCodecConfig.av1Config.chromaFormatIDC = 1;
         pIntializeParams->encodeConfig->encodeCodecConfig.av1Config.idrPeriod = pIntializeParams->encodeConfig->gopLength;
         if (m_bOutputInVideoMemory)
@@ -275,7 +277,7 @@ void NvEncoder::CreateEncoder(const NV_ENC_INITIALIZE_PARAMS* pEncoderParams)
     if (pEncoderParams->encodeGUID == NV_ENC_CODEC_HEVC_GUID)
     {
         bool yuv10BitFormat = (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT || m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV444_10BIT) ? true : false;
-        if (yuv10BitFormat && pEncoderParams->encodeConfig->encodeCodecConfig.hevcConfig.pixelBitDepthMinus8 != 2)
+        if (yuv10BitFormat && pEncoderParams->encodeConfig->encodeCodecConfig.hevcConfig.outputBitDepth != NV_ENC_BIT_DEPTH_10)
         {
             NVENC_THROW_ERROR("Invalid PixelBitdepth", NV_ENC_ERR_INVALID_PARAM);
         }
@@ -290,7 +292,7 @@ void NvEncoder::CreateEncoder(const NV_ENC_INITIALIZE_PARAMS* pEncoderParams)
     if (pEncoderParams->encodeGUID == NV_ENC_CODEC_AV1_GUID)
     {
         bool yuv10BitFormat = (m_eBufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT) ? true : false;
-        if (yuv10BitFormat && pEncoderParams->encodeConfig->encodeCodecConfig.av1Config.pixelBitDepthMinus8 != 2)
+        if (yuv10BitFormat && pEncoderParams->encodeConfig->encodeCodecConfig.av1Config.outputBitDepth != NV_ENC_BIT_DEPTH_10)
         {
             NVENC_THROW_ERROR("Invalid PixelBitdepth", NV_ENC_ERR_INVALID_PARAM);
         }
@@ -316,7 +318,8 @@ void NvEncoder::CreateEncoder(const NV_ENC_INITIALIZE_PARAMS* pEncoderParams)
     }
     else
     {
-        NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER, { NV_ENC_CONFIG_VER } };
+        NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER };
+        presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
         if (!m_bMotionEstimationOnly)
         {
             m_nvenc.nvEncGetEncodePresetConfigEx(m_hEncoder, pEncoderParams->encodeGUID, pEncoderParams->presetGUID, pEncoderParams->tuningInfo, &presetConfig);
@@ -446,6 +449,12 @@ const NvEncInputFrame* NvEncoder::GetNextInputFrame()
     return &m_vInputFrames[i];
 }
 
+const NvEncInputFrame* NvEncoder::GetNextInputFrame(int ahead)
+{
+    int i = (m_iToSend + ahead) % m_nEncoderBuffer;
+    return &m_vInputFrames[i];
+}
+
 const NvEncInputFrame* NvEncoder::GetNextReferenceFrame()
 {
     int i = m_iToSend % m_nEncoderBuffer;
@@ -523,6 +532,12 @@ void NvEncoder::CollectFrame(std::vector<std::vector<uint8_t>> &vPacket)
 {
     vPacket.clear();
     GetEncodedPacket(m_vBitstreamOutputBuffer, vPacket, true);
+}
+
+void NvEncoder::CollectAllFrames(std::vector<std::vector<uint8_t>> &vPacket)
+{
+    vPacket.clear();
+    GetEncodedPacket(m_vBitstreamOutputBuffer, vPacket, false);
 }
 
 void NvEncoder::RunMotionEstimation(std::vector<uint8_t> &mvData)
@@ -606,6 +621,13 @@ void NvEncoder::EndEncode(std::vector<std::vector<uint8_t>> &vPacket)
     if (!IsHWEncoderInitialized())
     {
         NVENC_THROW_ERROR("Encoder device not initialized", NV_ENC_ERR_ENCODER_NOT_INITIALIZED);
+    }
+
+    // Nothing to flush before the first picture; an MV-HEVC encoder never returned from the end of
+    // stream picture then (2026-10-16).
+    if (m_iToSend == 0)
+    {
+        return;
     }
 
     SendEOS();

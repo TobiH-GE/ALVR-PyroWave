@@ -37,7 +37,11 @@ private:
     );
     // The QP map of the picture columns [x0, x0 + width) (the whole frame, or one eye's half).
     void BuildQpDeltaMap(int x0, int width, std::vector<int8_t>& map);
-    void CreateEncoder(std::shared_ptr<NvEncoder>& encoder, int width, uint64_t bitrate_bps);
+    void CreateEncoder(std::shared_ptr<NvEncoder>& encoder, int width, uint64_t bitrate_bps, uint32_t extraOutputDelay = 0);
+    // MV-HEVC: encodes and sends one frame, its halves as the two views.
+    void TransmitMultiview(ID3D11Texture2D* pTexture, uint64_t targetTimestampNs, bool insertIDR, bool motion);
+    // MV-HEVC: queues one view, retrying once without the QP map if NVENC refuses it with the views.
+    void SubmitView(int view, std::vector<int8_t>& map, bool insertIDR);
     void SendPackets(std::vector<std::vector<uint8_t>>& packets, uint64_t targetTimestampNs, bool insertIDR, int eye);
 
     std::ofstream fpOut;
@@ -45,6 +49,10 @@ private:
     // "Encode eyes separately": m_NvNecoder encodes the left half, this one the right half.
     std::shared_ptr<NvEncoder> m_NvNecoderRight;
     bool m_splitEyes = false;
+    // "MV-HEVC": m_NvNecoder encodes the left half as view 0 and the right half as view 1 of one
+    // multiview HEVC stream (m_qpDeltaMap and m_qpDeltaMapRight per view).
+    bool m_mvHevc = false;
+    bool m_mvQpMapReported = false;
     int m_encodeWidth = 0;
 
     std::shared_ptr<CD3DRender> m_pD3DRender;
